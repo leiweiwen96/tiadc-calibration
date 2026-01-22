@@ -4,9 +4,268 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import scipy.signal as signal
+import matplotlib
+matplotlib.use("Agg")  # 保存图片到本地（兼容无显示环境）
 import matplotlib.pyplot as plt
 import sys
 import os
+import re
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+import json
+
+# ==============================================================================
+# Plot 保存工具（替代 plt.show）
+# ==============================================================================
+_PLOT_DIR: Optional[Path] = None
+
+
+def _get_plot_dir() -> Path:
+    """
+    统一的图片输出目录：<脚本目录>/plots/<运行时间戳>/
+    """
+    global _PLOT_DIR
+    if _PLOT_DIR is not None:
+        return _PLOT_DIR
+
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = Path(__file__).resolve().parent / "plots" / run_ts
+    base.mkdir(parents=True, exist_ok=True)
+    _PLOT_DIR = base
+    return _PLOT_DIR
+
+
+def _safe_stem(name: str) -> str:
+    name = name.strip()
+    # Windows/跨平台安全：只保留常见字符，其余替换为下划线
+    name = re.sub(r"[^0-9a-zA-Z._-]+", "_", name)
+    return name.strip("_") or "figure"
+
+
+def save_current_figure(name: str, *, dpi: int = 200, ext: str = "png") -> Path:
+    """
+    保存当前 figure 到本地，并自动 close 防止内存累积。
+
+    文件名规则：YYYYMMDD_HHMMSS_mmm_<name>.<ext>
+    目录规则：<脚本目录>/plots/<运行时间戳>/
+    """
+    out_dir = _get_plot_dir()
+    ts_ms = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # 毫秒
+    stem = _safe_stem(name)
+    out_path = out_dir / f"{ts_ms}_{stem}.{ext}"
+    plt.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"[plot] saved: {out_path}")
+    return out_path
+
+# ==============================================================================
+# Post-EQ（交织后 LTI 均衡器）：把整体 TIADC 输出往“单位冲激/恒等系统”校准
+# ------------------------------------------------------------------------------
+# 背景：
+# - 你希望移除 Stage3 的“非线性残差修整”，改成：
+#   先 Stage1/2 做通道对齐（Ch1->Ch0），再对交织后输出做一次整体校准，
+#   目标逼近“恒等系统”（等价于冲激响应≈δ[n]、相位/群延时对齐）。
+#
+# 这里的实现思路：
+# - 在全速率交织输出 y 上设计一个 LTI FIR g，使得 (g * y) ≈ x_target
+# - x_target 不是“全频带硬反卷积”，而是：
+#   先把理想输入限制在带宽内（POST_EQ_BAND_HZ），带外不强行追求恒等，
+#   否则会引起噪声放大/带外崩坏（典型 Wiener 反卷积问题）。
+# - 使用频域维纳反卷积（一次闭式求解，不走 Adam），并给带内高频更大权重。
+#
+# 重要：
+# - Post-EQ 是“交织后的整体校准”，是 LTI；它只能校整体幅相/群延时，
+#   不会像 PTV/Volterra 那样区分 even/odd 非线性。但它足够用于“单位冲激/恒等”的线性目标验证。
+# ==============================================================================
+
+
+def tiadc_interleave_from_fullrate(c0_full: np.ndarray, c1_full: np.ndarray) -> np.ndarray:
+    """
+    把两路 20GSps 全速率序列交织成 20GSps TIADC 输出（包含抽取）：
+    - 偶数点来自 c0_full[0::2]
+    - 奇数点来自 c1_full[1::2]
+    """
+    s0 = c0_full[0::2]
+    s1 = c1_full[1::2]
+    L = min(len(s0), len(s1))
+    out = np.zeros(2 * L, dtype=np.float64)
+    out[0::2] = s0[:L]
+    out[1::2] = s1[:L]
+    return out
+
+
+def design_post_eq_fir_wiener(
+    *,
+    y: np.ndarray,
+    x_target: np.ndarray,
+    fs_hz: float,
+    taps: int,
+    band_hz: float,
+    hf_weight: float,
+    ridge: float,
+) -> np.ndarray:
+    """
+    设计交织后 Post-EQ FIR（维纳反卷积）。
+
+    目标：找 g，使得 g * y ≈ x_target（带内）。
+
+    参数：
+    - y: 交织后的 TIADC 输出（20GSps）
+    - x_target: “理想恒等”目标（建议先做同带宽低通，避免带外反卷积）
+    - band_hz: 仅在该带宽内施加恒等目标（带外权重为 0）
+    - hf_weight: 带内频率权重指数，>1 更偏向高频幅相贴合
+    - ridge: 反卷积正则项（越大越保守，越不容易噪声放大）
+
+    返回：
+    - g: 时域 FIR（长度 taps，中心对齐；离线“非因果”意义下更适合恒等相位对齐）
+    """
+    y = np.asarray(y, dtype=np.float64)
+    x_target = np.asarray(x_target, dtype=np.float64)
+    n = min(len(y), len(x_target))
+    y = y[:n]
+    x_target = x_target[:n]
+
+    taps = int(taps)
+    if taps % 2 == 0:
+        taps += 1
+
+    win = np.hanning(n).astype(np.float64)
+    Y = np.fft.rfft(y * win, norm="ortho")
+    X = np.fft.rfft(x_target * win, norm="ortho")
+    Pyy = (Y.real**2 + Y.imag**2).astype(np.float64)
+
+    freqs = np.fft.rfftfreq(n, d=1.0 / float(fs_hz))
+    band = freqs <= float(band_hz)
+    wf = np.zeros_like(freqs, dtype=np.float64)
+    if np.any(band):
+        u = freqs[band] / max(float(band_hz), 1.0)
+        wf[band] = (0.2 + 0.8 * u) ** float(hf_weight)
+
+    # Wiener: G = X*conj(Y) / (|Y|^2 + ridge)，带权重 wf（带外=0）
+    G = (X * np.conj(Y) * wf) / (Pyy + float(ridge))
+    g_full = np.fft.irfft(G, n=n, norm="ortho")
+
+    # 让最大峰对齐到中心，截断 taps；并用窗函数缓解截断振铃
+    k = int(np.argmax(np.abs(g_full)))
+    g_roll = np.roll(g_full, -k)
+    g = g_roll[:taps].copy()
+    g = np.roll(g, taps // 2)
+    g = g * np.hanning(taps)
+    return g.astype(np.float64, copy=False)
+
+
+def attach_post_eq_fir(model: nn.Module, *, g: np.ndarray, device: str) -> None:
+    """
+    把时域 FIR g 挂载到 model.post_fir（nn.Conv1d），用于验证/推理。
+
+    注意：
+    - torch 的 Conv1d 本质是相关运算；这里通过翻转 g 实现“卷积等价”。
+    """
+    g = np.asarray(g, dtype=np.float64)
+    taps = int(len(g))
+    model.post_fir = nn.Conv1d(1, 1, kernel_size=taps, padding=taps // 2, bias=False).to(device)
+    with torch.no_grad():
+        w = torch.from_numpy(g[::-1].astype(np.float32)).view(1, 1, taps).to(device)
+        model.post_fir.weight.copy_(w)
+
+
+def apply_post_eq_fir(sig: np.ndarray, *, post_fir: nn.Module, device: str) -> np.ndarray:
+    """
+    应用交织后 Post-EQ FIR。
+    - 使用幅度归一化避免数值问题；输出恢复原尺度。
+    """
+    sig = np.asarray(sig, dtype=np.float64)
+    s = max(float(np.max(np.abs(sig))), 1e-12)
+    with torch.no_grad():
+        x = torch.FloatTensor(sig / s).view(1, 1, -1).to(device)
+        y = post_fir(x).cpu().numpy().flatten() * s
+    return y
+
+
+def build_and_attach_post_eq(
+    *,
+    simulator,
+    model: nn.Module,
+    base_sig: np.ndarray,
+    scale: float,
+    params_ch0: dict,
+    params_ch1: dict,
+    device: str,
+    taps: int,
+    band_hz: float,
+    hf_weight: float,
+    ridge: float,
+    use_reference_target: bool,
+    reference_snr_db: float,
+) -> None:
+    """
+    Post-EQ 一站式封装：
+    - 构造训练样本（使用无抖动/无量化的通道输出，避免把随机噪声当成可逆）
+    - 得到交织输出 y_tiadc（Ch0 + Cal(Ch1)）
+    - 构造带宽受限的理想目标 x_target
+    - 设计 FIR 并挂载到 model.post_fir
+    """
+    if use_reference_target:
+        print("\n=== Post-EQ: Interleaved output -> Reference Instrument (target) ===")
+    else:
+        print("\n=== Post-EQ: Interleaved output -> Unit-Impulse (Identity) ===")
+
+    # 1) 构造“干净”的交织输入
+    y0_clean = simulator.apply_channel_effect(base_sig, jitter_std=0, n_bits=None, **params_ch0)
+    y1_clean = simulator.apply_channel_effect(base_sig, jitter_std=0, n_bits=None, **params_ch1)
+    with torch.no_grad():
+        x1 = torch.FloatTensor(y1_clean / scale).view(1, 1, -1).to(device)
+        y1_cal = model(x1).cpu().numpy().flatten() * scale
+
+    y_tiadc = tiadc_interleave_from_fullrate(y0_clean, y1_cal)
+
+    # 2) 构造 target
+    # - 恒等口径：x_target = base_sig(带宽内)；更像“单位冲激/恒等系统校准”
+    # - 参考口径：x_target = reference instrument capture；更像“有参考的 foreground calibration”
+    if use_reference_target:
+        params_ref = {
+            "cutoff_freq": float(params_ch0["cutoff_freq"]),
+            "delay_samples": 0.0,
+            "gain": 1.0,
+            "hd2": 0.0,
+            "hd3": 0.0,
+            "snr_target": float(reference_snr_db),
+        }
+        y_ref_clean = simulator.apply_channel_effect(base_sig, jitter_std=0, n_bits=None, **params_ref)
+        x_target = y_ref_clean[: len(y_tiadc)].astype(np.float64, copy=False)
+
+        # 让指标绘图里也能看到 reference baseline（与 Stage3 的 reference_params 复用同一字段）
+        model.reference_params = params_ref
+    else:
+        b, a = signal.butter(6, float(band_hz) / (simulator.fs / 2), btype="low")
+        x_ideal = signal.lfilter(b, a, base_sig.astype(np.float64))
+        x_ideal = np.clip(x_ideal, -1.0, 1.0)
+        x_target = x_ideal[: len(y_tiadc)]
+
+    # 3) 设计 FIR 并挂载
+    taps = int(taps)
+    if taps % 2 == 0:
+        taps += 1
+    g = design_post_eq_fir_wiener(
+        y=y_tiadc,
+        x_target=x_target,
+        fs_hz=simulator.fs,
+        taps=taps,
+        band_hz=band_hz,
+        hf_weight=hf_weight,
+        ridge=ridge,
+    )
+    attach_post_eq_fir(model, g=g, device=device)
+    model.post_fir_meta = {
+        "taps": int(taps),
+        "band_hz": float(band_hz),
+        "hf_weight": float(hf_weight),
+        "ridge": float(ridge),
+        "use_reference_target": bool(use_reference_target),
+        "reference_snr_db": float(reference_snr_db),
+    }
+    print(f">> Post-EQ FIR ready: taps={taps}, band={band_hz/1e9:.2f}GHz, ridge={ridge:g}, hf_w={hf_weight:g}")
 
 # Windows 控制台常见编码问题（不影响算法，只为避免乱码）
 try:
@@ -27,8 +286,8 @@ np.random.seed(42)
 # - Stage3：非线性误差“修整”（对 TIADC 交织输出做 Volterra/记忆多项式后校正）
 #   这一阶段若仍用 Ch0 当 target，则 THD 的上限会被 Ch0 自身 hd2/hd3 锁死；
 #   因此默认使用“参考仪器”仿真数据作为 target（更贴近现实用高性能仪器做 foreground calibration）
-ENABLE_STAGE3_NONLINEAR = False  # True
-STAGE3_USE_REFERENCE_TARGET = False  # True
+ENABLE_STAGE3_NONLINEAR = True  # 需要对比 Post-NL 时建议开启；如只看线性校准可关掉
+STAGE3_USE_REFERENCE_TARGET = True   # True：用“参考仪器”作为上限目标；False：会被 Ch0 非线性锁死上限
 STAGE3_REFERENCE_SNR_DB = 120.0
 
 # Stage3 非线性模型选择（用于寻找“最好方案”做 A/B）
@@ -37,10 +296,41 @@ STAGE3_REFERENCE_SNR_DB = 120.0
 #
 # [新增] 更稳的求解方式：在 *_ls 模式下，用岭回归一次性解出最优参数（避免 Adam 训练把指标拉坏）
 # - ptv_poly_ls / ptv_volterra_ls: 推荐优先试（通常更稳、更不容易引入新 spur）
-STAGE3_SCHEME = "ptv_volterra"  # "ptv_poly" | "ptv_volterra" | "ptv_poly_ls" | "ptv_volterra_ls"
+STAGE3_SCHEME = "odd_volterra_ls"  # 推荐：odd_poly_ls/odd_volterra_ls（更稳）；也可用 ptv_* 系列
 STAGE3_SWEEP = False            # True 时：自动对比多种 scheme，选最优挂载
-STAGE3_SWEEP_SCHEMES = ("ptv_poly_ls", "ptv_volterra_ls", "ptv_poly", "ptv_volterra")
+STAGE3_SWEEP_SCHEMES = ("odd_poly_ls", "odd_volterra_ls", "ptv_poly_ls", "ptv_volterra_ls", "ptv_poly", "ptv_volterra")
 STAGE3_SWEEP_STEPS = 350        # sweep 时每个 scheme 的训练步数（快速找方向）
+
+# [新增] 自动搜索：在多个“目标定义 + 模型结构 + taps + 岭回归强度”上自动挑最优（推荐开启后跑一次）
+STAGE3_AUTOSEARCH = False
+STAGE3_AUTOSEARCH_MAX_TRIALS = 36          # 最大尝试次数（控制总耗时）
+STAGE3_AUTOSEARCH_EVAL_FREQS_GHZ = (0.5, 1.6, 2.1, 3.6, 5.1, 6.1)  # 快速评估的代表频点（覆盖中频与高频）
+STAGE3_AUTOSEARCH_FINE_FREQS_GHZ = (0.5, 1.0, 1.6, 2.1, 2.6, 3.1, 3.6, 4.1, 4.6, 5.1, 5.6, 6.1)
+STAGE3_AUTOSEARCH_EVAL_N_COARSE = 8192
+STAGE3_AUTOSEARCH_EVAL_N_FINE = 16384
+STAGE3_AUTOSEARCH_FINE_TOPK = 4            # 粗筛后保留多少个候选进入精搜
+STAGE3_AUTOSEARCH_THD_WORSEN_MAX_DB = 0.3  # 硬约束：任意评估频点 THD 变差不得超过该阈值（dB）
+STAGE3_AUTOSEARCH_TAPS_LIST = (5, 7, 9, 11, 15, 21)  # 只对 *volterra 生效（odd taps 更稳）
+STAGE3_AUTOSEARCH_RIDGE_LIST = (5e-1, 3e-1, 2e-1, 1e-1, 5e-2, 2e-2, 1e-2, 5e-3)  # 岭回归强度（越大越保守）
+STAGE3_AUTOSEARCH_LS_ROUNDS = (1, 2, 3)    # *_ls 的“轮数”
+STAGE3_AUTOSEARCH_HARM_WDELTA_LIST = (5.0, 10.0, 20.0, 40.0, 80.0)  # 仅对 *_harm_ls 生效
+
+# ------------------------------------------------------------------------------
+# [新方案] 交织后“单位冲激/恒等”校准（替代 Stage3 非线性残差修整）
+# - 先用 Stage1/2 做相对对齐（Ch1->Ch0）
+# - 再在全速率交织输出上训练/求解一个 LTI FIR，让整体响应尽量逼近“恒等系统”
+#   （等价于冲激响应逼近单位冲激，且相位/群延时对齐）
+# ------------------------------------------------------------------------------
+ENABLE_POST_EQ = True
+POST_EQ_TAPS = 127
+POST_EQ_RIDGE = 2e-3            # 维纳反卷积正则（越大越保守）
+POST_EQ_BAND_HZ = 6.2e9         # 只在该带宽内做“恒等”目标，带外不强行反卷积
+POST_EQ_HF_WEIGHT = 1.8         # 高频权重：>1 更偏向高频幅相贴合
+# [新增] Post-EQ 的训练目标：是否使用“参考仪器输出”作为 target
+# - False: target = 低通后的 base_sig（恒等/单位冲激口径），容易出现“整体指标不动/带外恶化”
+# - True : target = reference instrument capture（更符合“交织后给个参考，再做校正”的验证）
+POST_EQ_USE_REFERENCE_TARGET = True
+POST_EQ_REFERENCE_SNR_DB = 120.0  # 参考通道目标 SNR（dB），越大越接近“理想参考”
 
 STAGE3_TONE_N = 16384          # FFT 长度（建议 2^n，便于相干采样）
 STAGE3_BATCH = 9               # 每步 tone 个数（将按低/中/高分层采样）
@@ -113,6 +403,17 @@ STAGE3_HARM_LS_MAX_H = _env_int("STAGE3_HARM_LS_MAX_H", STAGE3_HARM_LS_MAX_H)
 STAGE3_HARM_LS_GUARD = _env_int("STAGE3_HARM_LS_GUARD", STAGE3_HARM_LS_GUARD)
 STAGE3_HARM_LS_INCLUDE_FUND = _env_bool("STAGE3_HARM_LS_INCLUDE_FUND", STAGE3_HARM_LS_INCLUDE_FUND)
 STAGE3_HARM_LS_W_DELTA = _env_float("STAGE3_HARM_LS_W_DELTA", STAGE3_HARM_LS_W_DELTA)
+STAGE3_AUTOSEARCH = _env_bool("STAGE3_AUTOSEARCH", STAGE3_AUTOSEARCH)
+STAGE3_AUTOSEARCH_MAX_TRIALS = _env_int("STAGE3_AUTOSEARCH_MAX_TRIALS", STAGE3_AUTOSEARCH_MAX_TRIALS)
+STAGE3_AUTOSEARCH_FINE_TOPK = _env_int("STAGE3_AUTOSEARCH_FINE_TOPK", STAGE3_AUTOSEARCH_FINE_TOPK)
+STAGE3_AUTOSEARCH_THD_WORSEN_MAX_DB = _env_float("STAGE3_AUTOSEARCH_THD_WORSEN_MAX_DB", STAGE3_AUTOSEARCH_THD_WORSEN_MAX_DB)
+ENABLE_POST_EQ = _env_bool("ENABLE_POST_EQ", ENABLE_POST_EQ)
+POST_EQ_TAPS = _env_int("POST_EQ_TAPS", POST_EQ_TAPS)
+POST_EQ_RIDGE = _env_float("POST_EQ_RIDGE", POST_EQ_RIDGE)
+POST_EQ_BAND_HZ = _env_float("POST_EQ_BAND_HZ", POST_EQ_BAND_HZ)
+POST_EQ_HF_WEIGHT = _env_float("POST_EQ_HF_WEIGHT", POST_EQ_HF_WEIGHT)
+POST_EQ_USE_REFERENCE_TARGET = _env_bool("POST_EQ_USE_REFERENCE_TARGET", POST_EQ_USE_REFERENCE_TARGET)
+POST_EQ_REFERENCE_SNR_DB = _env_float("POST_EQ_REFERENCE_SNR_DB", POST_EQ_REFERENCE_SNR_DB)
 
 # ------------------------------------------------------------------------------
 # 方向B增强：带记忆的非线性校正（Parallel Hammerstein）
@@ -261,6 +562,62 @@ class PTVMemorylessPoly23(nn.Module):
         mask_odd = 1.0 - mask_even
 
         return x + even * mask_even + odd * mask_odd
+
+
+class OddOnlyVolterraNetwork(nn.Module):
+    """
+    [新方案] 只修 odd(Ch1) 采样相位的 Volterra(2/3 次 + 记忆 taps)。
+
+    设计动机：
+    - 子 ADC 的非线性主要发生在各自采样相位上；交织后再“全局修”会把 even/odd 耦合在一起，容易欠定并引入新 spur。
+    - 只对 odd 相位修正，能显著降低自由度与耦合，稳定性通常更好。
+
+    形式：
+      y[n] = x[n] + mask_odd * (Conv(x^2, w2) + Conv(x^3, w3))
+    """
+
+    def __init__(self, taps: int = 21):
+        super().__init__()
+        self.taps = int(taps)
+        self.conv2 = nn.Conv1d(1, 1, kernel_size=self.taps, padding=self.taps // 2, bias=False)
+        self.conv3 = nn.Conv1d(1, 1, kernel_size=self.taps, padding=self.taps // 2, bias=False)
+        with torch.no_grad():
+            for m in [self.conv2, self.conv3]:
+                m.weight.data.normal_(0, 1e-6)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, -1.0, 1.0)
+        B, C, T = x.shape
+        x2 = x ** 2
+        x3 = x ** 3
+        corr = self.conv2(x2) + self.conv3(x3)
+        mask_even = torch.zeros((1, 1, T), device=x.device, dtype=x.dtype)
+        mask_even[:, :, 0::2] = 1.0
+        mask_odd = 1.0 - mask_even
+        return x + corr * mask_odd
+
+
+class OddOnlyMemorylessPoly23(nn.Module):
+    """
+    [新方案] 只修 odd(Ch1) 采样相位的记忆无关 2/3 次多项式：
+      y[n] = x[n] + (a2*x^2 + a3*x^3) * mask_odd
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.a2 = nn.Parameter(torch.tensor(0.0))
+        self.a3 = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, -1.0, 1.0)
+        B, C, T = x.shape
+        x2 = x ** 2
+        x3 = x ** 3
+        corr = self.a2 * x2 + self.a3 * x3
+        mask_even = torch.zeros((1, 1, T), device=x.device, dtype=x.dtype)
+        mask_even[:, :, 0::2] = 1.0
+        mask_odd = 1.0 - mask_even
+        return x + corr * mask_odd
 
 
 def _fold_freq_to_nyquist(f_hz: float, fs_hz: float) -> float:
@@ -700,6 +1057,345 @@ def train_relative_calibration(simulator, device='cpu'):
         loss.backward()
         opt_s2.step()
 
+    # --------------------------------------------------------------------------
+    # [替代 Stage3] 交织后 Post-EQ（封装版）：把整体 TIADC 输出往“恒等/单位冲激”拉
+    # --------------------------------------------------------------------------
+    if ENABLE_POST_EQ:
+        build_and_attach_post_eq(
+            simulator=simulator,
+            model=model,
+            base_sig=base_sig,
+            scale=float(scale),
+            params_ch0=params_ch0,
+            params_ch1=params_ch1,
+            device=device,
+            taps=int(POST_EQ_TAPS),
+            band_hz=float(POST_EQ_BAND_HZ),
+            hf_weight=float(POST_EQ_HF_WEIGHT),
+            ridge=float(POST_EQ_RIDGE),
+            use_reference_target=bool(POST_EQ_USE_REFERENCE_TARGET),
+            reference_snr_db=float(POST_EQ_REFERENCE_SNR_DB),
+        )
+    else:
+        model.post_fir = None
+        model.post_fir_meta = None
+
+    # --------------------------------------------------------------------------
+    # Stage3 自动搜索：固定 Stage1/2，只在 Stage3 上做有限预算搜索，自动选最优
+    # --------------------------------------------------------------------------
+    def _calc_spectrum_metrics_fast(sig: np.ndarray, fs: float, input_freq: float):
+        # 与 calculate_metrics_detailed 的口径保持一致（Blackman + 谐波折叠）
+        sig = np.asarray(sig, dtype=np.float64)
+        n = len(sig)
+        win = np.blackman(n)
+        cg = float(np.mean(win))
+        fft_spec = np.fft.rfft(sig * win)
+        fft_mag = np.abs(fft_spec) / (n / 2 * cg + 1e-20)
+        freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
+        idx_fund = int(np.argmin(np.abs(freqs - input_freq)))
+        span = 5
+        s = max(0, idx_fund - span)
+        e = min(len(fft_mag), idx_fund + span + 1)
+        idx_peak = s + int(np.argmax(fft_mag[s:e]))
+        p_fund = float(fft_mag[idx_peak] ** 2) + 1e-30
+
+        mask = np.ones_like(fft_mag, dtype=bool)
+        mask[:5] = False
+        mask[max(0, idx_peak - span): min(len(mask), idx_peak + span + 1)] = False
+        p_noise_dist = float(np.sum(fft_mag[mask] ** 2)) + 1e-30
+        sinad = 10.0 * np.log10(p_fund / p_noise_dist)
+        enob = (sinad - 1.76) / 6.02
+        p_spur_max = float(np.max(fft_mag[mask] ** 2)) if np.any(mask) else 1e-30
+        sfdr = 10.0 * np.log10(p_fund / (p_spur_max + 1e-30))
+
+        # THD (2~5 次谐波，折叠到 Nyquist 内)
+        p_harm = 0.0
+        for h in range(2, 6):
+            hf = (input_freq * h) % fs
+            if hf > fs / 2:
+                hf = fs - hf
+            if hf < 1e6 or hf > fs / 2 - 1e6:
+                continue
+            k = int(np.argmin(np.abs(freqs - hf)))
+            ss = max(0, k - span)
+            ee = min(len(fft_mag), k + span + 1)
+            kk = ss + int(np.argmax(fft_mag[ss:ee]))
+            p_harm += float(fft_mag[kk] ** 2)
+        thd = 10.0 * np.log10((p_harm + 1e-30) / p_fund)
+        return float(sinad), float(enob), float(thd), float(sfdr)
+
+    def _interleave_for_metric(c0_full: np.ndarray, c1_full: np.ndarray) -> np.ndarray:
+        # 与 calculate_metrics_detailed 的 interleave 保持一致（先抽取再交织）
+        s0 = c0_full[0::2]
+        s1 = c1_full[1::2]
+        L = min(len(s0), len(s1))
+        out = np.zeros(2 * L, dtype=np.float64)
+        out[0::2] = s0[:L]
+        out[1::2] = s1[:L]
+        return out
+
+    def _apply_stage3_post(sig_post_lin: np.ndarray) -> np.ndarray:
+        if not (hasattr(model, "post_linearizer") and model.post_linearizer is not None):
+            return sig_post_lin
+        s = max(float(np.max(np.abs(sig_post_lin))), 1e-12)
+        with torch.no_grad():
+            x = torch.FloatTensor(sig_post_lin / s).view(1, 1, -1).to(device)
+            y = model.post_linearizer(x).cpu().numpy().flatten() * s
+        return y
+
+    def _quick_eval(in_freqs_hz, *, tone_n: int):
+        # 返回 dict：线性与非线性后的“逐频点”与汇总（均值/最差下降）
+        sin_lin, sf_lin, th_lin = [], [], []
+        sin_nl, sf_nl, th_nl = [], [], []
+
+        for f in in_freqs_hz:
+            src = simulator.generate_tone_data(f, N=int(tone_n))
+            y0 = simulator.apply_channel_effect(src, jitter_std=0, n_bits=None, **params_ch0)
+            y1 = simulator.apply_channel_effect(src, jitter_std=0, n_bits=None, **params_ch1)
+            with torch.no_grad():
+                x1 = torch.FloatTensor(y1 / scale).view(1, 1, -1).to(device)
+                y1c = model(x1).cpu().numpy().flatten() * scale
+
+            sig_post_lin = _interleave_for_metric(y0, y1c)
+            sig_post_nl = _apply_stage3_post(sig_post_lin)
+
+            s1, _, t1, sf1 = _calc_spectrum_metrics_fast(sig_post_lin, simulator.fs, f)
+            s2, _, t2, sf2 = _calc_spectrum_metrics_fast(sig_post_nl, simulator.fs, f)
+            sin_lin.append(s1); sf_lin.append(sf1); th_lin.append(t1)
+            sin_nl.append(s2); sf_nl.append(sf2); th_nl.append(t2)
+
+        sin_lin = np.asarray(sin_lin, dtype=np.float64)
+        sf_lin = np.asarray(sf_lin, dtype=np.float64)
+        th_lin = np.asarray(th_lin, dtype=np.float64)
+        sin_nl = np.asarray(sin_nl, dtype=np.float64)
+        sf_nl = np.asarray(sf_nl, dtype=np.float64)
+        th_nl = np.asarray(th_nl, dtype=np.float64)
+
+        return {
+            "sin_lin_arr": sin_lin,
+            "sfdr_lin_arr": sf_lin,
+            "thd_lin_arr": th_lin,
+            "sin_nl_arr": sin_nl,
+            "sfdr_nl_arr": sf_nl,
+            "thd_nl_arr": th_nl,
+            "sin_lin": float(np.mean(sin_lin)),
+            "sfdr_lin": float(np.mean(sf_lin)),
+            "thd_lin": float(np.mean(th_lin)),
+            "sin_nl": float(np.mean(sin_nl)),
+            "sfdr_nl": float(np.mean(sf_nl)),
+            "thd_nl": float(np.mean(th_nl)),
+            "sin_drop_max": float(np.max(sin_lin - sin_nl)),
+            "sfdr_drop_max": float(np.max(sf_lin - sf_nl)),
+        }
+
+    def _autosearch_stage3():
+        # 备份全局配置，试完恢复
+        global STAGE3_TAPS, STAGE3_LS_RIDGE, STAGE3_USE_REFERENCE_TARGET, STAGE3_SCHEME, STAGE3_STEPS, STAGE3_HARM_LS_W_DELTA, STAGE3_LS_TONE_BATCH
+        bak = (STAGE3_TAPS, STAGE3_LS_RIDGE, STAGE3_USE_REFERENCE_TARGET, STAGE3_SCHEME, STAGE3_STEPS, STAGE3_HARM_LS_W_DELTA, STAGE3_LS_TONE_BATCH)
+
+        eval_freqs = [float(x) * 1e9 for x in STAGE3_AUTOSEARCH_EVAL_FREQS_GHZ]
+        fine_freqs = [float(x) * 1e9 for x in STAGE3_AUTOSEARCH_FINE_FREQS_GHZ]
+
+        # baseline：不挂 Stage3
+        model.post_linearizer = None
+        model.post_linearizer_scale = None
+        model.reference_params = None
+        base_m = _quick_eval(eval_freqs, tone_n=int(STAGE3_AUTOSEARCH_EVAL_N_COARSE))
+        print(f"[AutoSearch] baseline (no stage3) | SINAD={base_m['sin_lin']:.2f} | SFDR={base_m['sfdr_lin']:.2f} | THD={base_m['thd_lin']:.2f}")
+
+        trials = []
+
+        # 构造候选：odd_* 默认用 match_ch0(target=False)，ptv_* 两种 target 都试
+        schemes = ["odd_poly_ls", "odd_volterra_ls", "ptv_poly_ls", "ptv_volterra_ls", "ptv_volterra_harm_ls", "ptv_poly_harm_ls"]
+        for scheme in schemes:
+            is_volterra = ("volterra" in scheme)
+            taps_list = list(STAGE3_AUTOSEARCH_TAPS_LIST) if is_volterra else [STAGE3_TAPS]
+            ridge_list = list(STAGE3_AUTOSEARCH_RIDGE_LIST)
+            rounds_list = list(STAGE3_AUTOSEARCH_LS_ROUNDS) if scheme.endswith("_ls") or scheme.endswith("_harm_ls") else [int(STAGE3_STEPS)]
+            wdelta_list = list(STAGE3_AUTOSEARCH_HARM_WDELTA_LIST) if scheme.endswith("_harm_ls") else [float(STAGE3_HARM_LS_W_DELTA)]
+            if scheme.startswith("odd_"):
+                target_list = [False]  # 只对齐到 Ch0（避免为追 reference 而扭曲 odd）
+            else:
+                target_list = [True, False]
+
+            for use_ref in target_list:
+                for taps in taps_list:
+                    for ridge in ridge_list:
+                        for rounds in rounds_list:
+                            for wdelta in wdelta_list:
+                                trials.append((scheme, use_ref, int(taps), float(ridge), int(rounds), float(wdelta)))
+
+        # 控制预算：先按“保守优先”排序（ridge 大、rounds 小优先），更容易不翻车
+        trials.sort(key=lambda x: (-x[3], x[4], x[2], -x[5]))
+        trials = trials[: int(STAGE3_AUTOSEARCH_MAX_TRIALS)]
+
+        # ----------------------------
+        # Phase A: 粗筛（快速、保守）
+        # ----------------------------
+        coarse_results = []
+        best = None
+        best_dd = None
+        best_ref = None
+
+        for idx, (scheme, use_ref, taps, ridge, rounds, wdelta) in enumerate(trials, 1):
+            STAGE3_SCHEME = scheme
+            STAGE3_USE_REFERENCE_TARGET = bool(use_ref)
+            STAGE3_TAPS = int(taps)
+            STAGE3_LS_RIDGE = float(ridge)
+            STAGE3_STEPS = int(rounds)
+            STAGE3_HARM_LS_W_DELTA = float(wdelta)
+            # 粗筛时 tone_batch 小一点更快
+            STAGE3_LS_TONE_BATCH = min(int(STAGE3_LS_TONE_BATCH), 6)
+
+            print(f"\n[AutoSearch] coarse {idx}/{len(trials)} try scheme={scheme} use_ref={use_ref} taps={taps} ridge={ridge:g} rounds={rounds} wdelta={wdelta:g}")
+            try:
+                dd, params_ref = _train_stage3_one_scheme(scheme=scheme, steps=int(rounds))
+            except Exception as e:
+                print(f"[AutoSearch] skip (train error): {e}")
+                continue
+
+            model.post_linearizer = dd
+            model.post_linearizer_scale = None
+            model.reference_params = params_ref if use_ref else None
+
+            m = _quick_eval(eval_freqs, tone_n=int(STAGE3_AUTOSEARCH_EVAL_N_COARSE))
+
+            # 评分：硬约束使用“最差下降”（防止某个频点明显变差），再看均值收益
+            sin_drop_max = float(m["sin_drop_max"])
+            sf_drop_max = float(m["sfdr_drop_max"])
+            thd_worsen_max = float(np.max(m["thd_nl_arr"] - m["thd_lin_arr"]))
+            ok = (sin_drop_max <= 0.2) and (sf_drop_max <= 0.5) and (thd_worsen_max <= float(STAGE3_AUTOSEARCH_THD_WORSEN_MAX_DB))
+
+            sin_gain = float(m["sin_nl"] - base_m["sin_lin"])
+            sf_gain = float(m["sfdr_nl"] - base_m["sfdr_lin"])
+            th_gain = float(((-m["thd_nl"]) - (-base_m["thd_lin"])))  # THD 更负更好
+
+            score = sf_gain + 0.2 * th_gain + 0.2 * sin_gain - 6.0 * max(0.0, sin_drop_max) - 2.0 * max(0.0, sf_drop_max)
+            print(
+                f"[AutoSearch] eval | SINAD_nl={m['sin_nl']:.2f} (mean gain {sin_gain:+.2f}, max drop {sin_drop_max:+.2f}) | "
+                f"SFDR_nl={m['sfdr_nl']:.2f} (mean gain {sf_gain:+.2f}, max drop {sf_drop_max:+.2f}) | "
+                f"THD_nl={m['thd_nl']:.2f} (max worsen {thd_worsen_max:+.2f}) | score={score:.3f} | ok={ok}"
+            )
+
+            if not ok:
+                continue
+
+            cand = (score, m, scheme, use_ref, taps, ridge, rounds, wdelta)
+            coarse_results.append(cand)
+            if (best is None) or (cand[0] > best[0]):
+                best = cand
+                best_dd = dd
+                best_ref = params_ref if use_ref else None
+
+        # ----------------------------
+        # Phase B: 精搜（围绕 TopK 做更严格评估）
+        # ----------------------------
+        coarse_results.sort(key=lambda x: x[0], reverse=True)
+        topk = coarse_results[: int(max(1, STAGE3_AUTOSEARCH_FINE_TOPK))]
+        if len(topk) > 0:
+            print(f"\n[AutoSearch] fine stage: refine top {len(topk)} candidates")
+
+        for rank, (score0, m0, scheme0, use_ref0, taps0, ridge0, rounds0, wdelta0) in enumerate(topk, 1):
+            # 细化：ridge 在周围做 0.5x/1x/2x，rounds 固定 1（避免过拟合）但 tone_batch 加大更稳
+            ridge_cands = sorted(set([ridge0 * 0.5, ridge0, ridge0 * 2.0]))
+            ridge_cands = [float(r) for r in ridge_cands if 1e-4 <= r <= 1.0]
+            rounds_cands = [1]
+            wdelta_cands = [wdelta0]
+            if str(scheme0).endswith("_harm_ls"):
+                wdelta_cands = list(STAGE3_AUTOSEARCH_HARM_WDELTA_LIST)
+
+            for ridge in ridge_cands:
+                for rounds in rounds_cands:
+                    for wdelta in wdelta_cands:
+                        STAGE3_SCHEME = scheme0
+                        STAGE3_USE_REFERENCE_TARGET = bool(use_ref0)
+                        STAGE3_TAPS = int(taps0)
+                        STAGE3_LS_RIDGE = float(ridge)
+                        STAGE3_STEPS = int(rounds)
+                        STAGE3_HARM_LS_W_DELTA = float(wdelta)
+                        # 精搜：tone_batch 加大一些，估计更稳
+                        STAGE3_LS_TONE_BATCH = max(int(STAGE3_LS_TONE_BATCH), 10)
+
+                        print(f"\n[AutoSearch] fine {rank}/{len(topk)} try scheme={scheme0} use_ref={use_ref0} taps={taps0} ridge={ridge:g} rounds={rounds} wdelta={wdelta:g}")
+                        try:
+                            dd, params_ref = _train_stage3_one_scheme(scheme=scheme0, steps=int(rounds))
+                        except Exception as e:
+                            print(f"[AutoSearch] fine skip (train error): {e}")
+                            continue
+
+                        model.post_linearizer = dd
+                        model.post_linearizer_scale = None
+                        model.reference_params = params_ref if use_ref0 else None
+
+                        m = _quick_eval(fine_freqs, tone_n=int(STAGE3_AUTOSEARCH_EVAL_N_FINE))
+                        sin_drop_max = float(m["sin_drop_max"])
+                        sf_drop_max = float(m["sfdr_drop_max"])
+                        thd_worsen_max = float(np.max(m["thd_nl_arr"] - m["thd_lin_arr"]))
+
+                        # 精搜硬约束更严格
+                        ok = (sin_drop_max <= 0.15) and (sf_drop_max <= 0.35) and (thd_worsen_max <= float(STAGE3_AUTOSEARCH_THD_WORSEN_MAX_DB))
+
+                        sin_gain = float(m["sin_nl"] - base_m["sin_lin"])
+                        sf_gain = float(m["sfdr_nl"] - base_m["sfdr_lin"])
+                        th_gain = float(((-m["thd_nl"]) - (-base_m["thd_lin"])))
+                        score = sf_gain + 0.25 * th_gain + 0.25 * sin_gain - 8.0 * max(0.0, sin_drop_max) - 3.0 * max(0.0, sf_drop_max)
+
+                        print(
+                            f"[AutoSearch] fine eval | SINAD_nl={m['sin_nl']:.2f} (mean gain {sin_gain:+.2f}, max drop {sin_drop_max:+.2f}) | "
+                            f"SFDR_nl={m['sfdr_nl']:.2f} (mean gain {sf_gain:+.2f}, max drop {sf_drop_max:+.2f}) | "
+                            f"THD_nl={m['thd_nl']:.2f} (max worsen {thd_worsen_max:+.2f}) | score={score:.3f} | ok={ok}"
+                        )
+
+                        if not ok:
+                            continue
+
+                        cand = (score, m, scheme0, use_ref0, taps0, ridge, rounds, wdelta)
+                        if (best is None) or (cand[0] > best[0]):
+                            best = cand
+                            best_dd = dd
+                            best_ref = params_ref if use_ref0 else None
+
+        # 恢复全局配置（但把最佳模型挂回去）
+        STAGE3_TAPS, STAGE3_LS_RIDGE, STAGE3_USE_REFERENCE_TARGET, STAGE3_SCHEME, STAGE3_STEPS, STAGE3_HARM_LS_W_DELTA, STAGE3_LS_TONE_BATCH = bak
+
+        if best is None:
+            print("[AutoSearch] 未找到比 baseline 更稳的 Stage3（自动关闭 Stage3）。")
+            model.post_linearizer = None
+            model.post_linearizer_scale = None
+            model.reference_params = None
+            return None
+
+        _, m, scheme, use_ref, taps, ridge, rounds, wdelta = best
+        print(
+            f"[AutoSearch] BEST: scheme={scheme} use_ref={use_ref} taps={taps} ridge={ridge:g} rounds={rounds} | "
+            f"SINAD={m['sin_nl']:.2f} SFDR={m['sfdr_nl']:.2f} THD={m['thd_nl']:.2f} | "
+            f"max_drop: SINAD {m['sin_drop_max']:+.2f}, SFDR {m['sfdr_drop_max']:+.2f}"
+        )
+
+        model.post_linearizer = best_dd
+        model.post_linearizer_scale = None
+        model.reference_params = best_ref
+        best_cfg = {
+            "scheme": scheme,
+            "use_ref": bool(use_ref),
+            "taps": int(taps),
+            "ridge": float(ridge),
+            "rounds": int(rounds),
+            "harm_wdelta": float(wdelta),
+            "eval_freqs_ghz": list(STAGE3_AUTOSEARCH_EVAL_FREQS_GHZ),
+            "fine_freqs_ghz": list(STAGE3_AUTOSEARCH_FINE_FREQS_GHZ),
+        }
+        try:
+            out_dir = _get_plot_dir()
+            out_path = out_dir / "best_stage3_config.json"
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(best_cfg, f, ensure_ascii=False, indent=2)
+            print(f"[AutoSearch] saved config: {out_path}")
+        except Exception as e:
+            print(f"[AutoSearch] save config failed: {e}")
+        return best_cfg
+
     # === Stage 3: Nonlinear Error Trimming (Volterra / Memory Polynomial) ===
     #
     # 目的：对“交织后的 TIADC 输出”做非线性残差修整（主要改善 THD，同时兼顾 SFDR/SINAD）。
@@ -778,6 +1474,10 @@ def train_relative_calibration(simulator, device='cpu'):
             ddsp_model = DDSPVolterraNetwork(taps=STAGE3_TAPS).to(device)
         elif base == "ptv_poly":
             ddsp_model = PTVMemorylessPoly23().to(device)
+        elif base == "odd_volterra":
+            ddsp_model = OddOnlyVolterraNetwork(taps=STAGE3_TAPS).to(device)
+        elif base == "odd_poly":
+            ddsp_model = OddOnlyMemorylessPoly23().to(device)
         else:
             raise ValueError(f"Unknown scheme={scheme!r} (base={base!r})")
 
@@ -799,8 +1499,14 @@ def train_relative_calibration(simulator, device='cpu'):
 
             if base == "ptv_volterra":
                 P = 4 * taps
-            else:
+            elif base == "ptv_poly":
                 P = 4
+            elif base == "odd_volterra":
+                P = 2 * taps
+            elif base == "odd_poly":
+                P = 2
+            else:
+                raise ValueError(f"Unknown base={base!r}")
 
             A = np.zeros((P, P), dtype=np.float64)
             bb = np.zeros((P,), dtype=np.float64)
@@ -854,7 +1560,7 @@ def train_relative_calibration(simulator, device='cpu'):
                     Phi[even_loc, 1] = x3[even_loc]
                     Phi[odd_loc, 2] = x2[odd_loc]
                     Phi[odd_loc, 3] = x3[odd_loc]
-                else:
+                elif base == "ptv_volterra":
                     x2w = _sliding_windows_1d(x2, taps)
                     x3w = _sliding_windows_1d(x3, taps)
                     Phi = np.zeros((len(x), 4 * taps), dtype=np.float64)
@@ -862,6 +1568,21 @@ def train_relative_calibration(simulator, device='cpu'):
                     Phi[even_loc, taps:2 * taps] = x3w[even_loc]
                     Phi[odd_loc, 2 * taps:3 * taps] = x2w[odd_loc]
                     Phi[odd_loc, 3 * taps:4 * taps] = x3w[odd_loc]
+                elif base == "odd_poly":
+                    # 只拟合 odd 相位，降低耦合（更稳）
+                    idx = odd_loc
+                    Phi = np.zeros((len(x), 2), dtype=np.float64)
+                    Phi[idx, 0] = x2[idx]
+                    Phi[idx, 1] = x3[idx]
+                elif base == "odd_volterra":
+                    idx = odd_loc
+                    x2w = _sliding_windows_1d(x2, taps)
+                    x3w = _sliding_windows_1d(x3, taps)
+                    Phi = np.zeros((len(x), 2 * taps), dtype=np.float64)
+                    Phi[idx, 0:taps] = x2w[idx]
+                    Phi[idx, taps:2 * taps] = x3w[idx]
+                else:
+                    raise ValueError(f"Unknown base={base!r}")
 
                 A[:] = A + Phi.T @ Phi
                 bb[:] = bb + Phi.T @ r
@@ -875,7 +1596,7 @@ def train_relative_calibration(simulator, device='cpu'):
                     ddsp_model.a3_even.copy_(torch.tensor(w[1], device=device, dtype=torch.float32))
                     ddsp_model.a2_odd.copy_(torch.tensor(w[2], device=device, dtype=torch.float32))
                     ddsp_model.a3_odd.copy_(torch.tensor(w[3], device=device, dtype=torch.float32))
-            else:
+            elif base == "ptv_volterra":
                 taps = STAGE3_TAPS
                 w = w.astype(np.float32, copy=False)
                 with torch.no_grad():
@@ -883,6 +1604,18 @@ def train_relative_calibration(simulator, device='cpu'):
                     ddsp_model.conv3_even.weight.copy_(torch.from_numpy(w[taps:2 * taps]).view(1, 1, taps).to(device))
                     ddsp_model.conv2_odd.weight.copy_(torch.from_numpy(w[2 * taps:3 * taps]).view(1, 1, taps).to(device))
                     ddsp_model.conv3_odd.weight.copy_(torch.from_numpy(w[3 * taps:4 * taps]).view(1, 1, taps).to(device))
+            elif base == "odd_poly":
+                with torch.no_grad():
+                    ddsp_model.a2.copy_(torch.tensor(w[0], device=device, dtype=torch.float32))
+                    ddsp_model.a3.copy_(torch.tensor(w[1], device=device, dtype=torch.float32))
+            elif base == "odd_volterra":
+                taps = STAGE3_TAPS
+                w = w.astype(np.float32, copy=False)
+                with torch.no_grad():
+                    ddsp_model.conv2.weight.copy_(torch.from_numpy(w[0:taps]).view(1, 1, taps).to(device))
+                    ddsp_model.conv3.weight.copy_(torch.from_numpy(w[taps:2 * taps]).view(1, 1, taps).to(device))
+            else:
+                raise ValueError(f"Unknown base={base!r}")
 
         def _fit_harm_ls_once(ks: np.ndarray):
             """
@@ -1030,6 +1763,8 @@ def train_relative_calibration(simulator, device='cpu'):
             return ddsp_model, params_ref
 
         if solver == "harm_ls":
+            if base in ("odd_poly", "odd_volterra"):
+                raise ValueError("odd_* 暂不支持 _harm_ls（建议用 *_ls：更稳且更符合 odd-only 设计）")
             rounds = max(1, int(steps))
             for rr in range(rounds):
                 ks = np.random.choice(cand_bins, size=int(STAGE3_LS_TONE_BATCH), replace=True).astype(int)
@@ -1131,8 +1866,17 @@ def train_relative_calibration(simulator, device='cpu'):
         return ddsp_model, params_ref
 
     ddsp_model = None
-    if ENABLE_STAGE3_NONLINEAR:
-        if STAGE3_SWEEP:
+    # 若启用 Post-EQ，则默认不再训练 Stage3（避免两套后级互相“打架”）
+    if (not ENABLE_POST_EQ) and ENABLE_STAGE3_NONLINEAR:
+        if STAGE3_AUTOSEARCH:
+            print("\n=== Stage 3: AutoSearch (fixed Stage1/2, search best Stage3 config) ===")
+            best_cfg = _autosearch_stage3()
+            ddsp_model = getattr(model, "post_linearizer", None)
+            if best_cfg is not None:
+                print(f"[AutoSearch] chosen config: {best_cfg}")
+            else:
+                print("[AutoSearch] chosen config: None (Stage3 disabled)")
+        elif STAGE3_SWEEP:
             # 只训练一次线性，然后对比不同 scheme，选一个“全带更稳”的
             best = None
             best_score = None
@@ -1176,6 +1920,10 @@ def train_relative_calibration(simulator, device='cpu'):
             model.post_linearizer = ddsp_model
             model.post_linearizer_scale = None
             model.reference_params = params_ref if STAGE3_USE_REFERENCE_TARGET else None
+    else:
+        # 明确关闭旧 Stage3
+        model.post_linearizer = None
+        model.post_linearizer_scale = None
 
     print(f"训练完成。返回 5 个对象。")
     return model, ddsp_model, scale, params_ch0, params_ch1
@@ -1512,6 +2260,11 @@ def calculate_metrics_detailed(sim, model, scale, device, p_ch0, p_ch1):
         'thd_pre': [],   'thd_post': [],
         'sfdr_pre': [],  'sfdr_post': []
     }
+    # [新增] 若启用了交织后 Post-EQ（post_fir），单独给出 Post-EQ 曲线（避免被 Stage3 覆盖看不到）
+    metrics.update({
+        'sinad_post_eq': [], 'enob_post_eq': [], 'thd_post_eq': [], 'sfdr_post_eq': []
+    })
+
     # 若启用了非线性后级，额外给出一套“线性+非线性”的指标，保证线性口径不被覆盖
     metrics.update({
         'sinad_post_nl': [], 'enob_post_nl': [], 'thd_post_nl': [], 'sfdr_post_nl': []
@@ -1627,9 +2380,14 @@ def calculate_metrics_detailed(sim, model, scale, device, p_ch0, p_ch1):
         # 构建 TIADC 全速率信号
         sig_pre = interleave(c0, c1_raw)
         sig_post_lin = interleave(c0, c1_cal)
-        sig_post_nl = None
 
-        # 若有 post_linearizer（交织后非线性修整），只影响 *_post_nl，不覆盖线性 *_post
+        # 先算 Post-EQ（交织后线性均衡）：只影响 *_post_eq，不与 Stage3 “后级非线性”混淆
+        if hasattr(model, "post_fir") and model.post_fir is not None:
+            sig_post_eq = apply_post_eq_fir(sig_post_lin, post_fir=model.post_fir, device=device)
+        else:
+            sig_post_eq = sig_post_lin
+
+        # 再算 Post-NL（交织后非线性修整）：保持与训练口径一致（默认作用于 sig_post_lin）
         if hasattr(model, 'post_linearizer') and model.post_linearizer is not None:
             scale_pl = getattr(model, 'post_linearizer_scale', None)
             if scale_pl is None:
@@ -1638,6 +2396,8 @@ def calculate_metrics_detailed(sim, model, scale, device, p_ch0, p_ch1):
             with torch.no_grad():
                 sig_final_t = model.post_linearizer(sig_post_t)
             sig_post_nl = sig_final_t.cpu().numpy().flatten() * scale_pl
+        else:
+            sig_post_nl = sig_post_eq
 
         # 参考基线（可选）
         if p_ref is not None:
@@ -1652,10 +2412,8 @@ def calculate_metrics_detailed(sim, model, scale, device, p_ch0, p_ch1):
         # 计算指标
         s_pre, e_pre, t_pre, sf_pre = calc_spectrum_metrics(sig_pre, sim.fs, f)
         s_post, e_post, t_post, sf_post = calc_spectrum_metrics(sig_post_lin, sim.fs, f)
-        if sig_post_nl is not None:
-            s_nl, e_nl, t_nl, sf_nl = calc_spectrum_metrics(sig_post_nl, sim.fs, f)
-        else:
-            s_nl, e_nl, t_nl, sf_nl = s_post, e_post, t_post, sf_post
+        s_eq, e_eq, t_eq, sf_eq = calc_spectrum_metrics(sig_post_eq, sim.fs, f)
+        s_nl, e_nl, t_nl, sf_nl = calc_spectrum_metrics(sig_post_nl, sim.fs, f)
         
         metrics['sinad_pre'].append(s_pre)
         metrics['sinad_post'].append(s_post)
@@ -1665,6 +2423,11 @@ def calculate_metrics_detailed(sim, model, scale, device, p_ch0, p_ch1):
         metrics['thd_post'].append(t_post)
         metrics['sfdr_pre'].append(sf_pre)
         metrics['sfdr_post'].append(sf_post)
+
+        metrics['sinad_post_eq'].append(s_eq)
+        metrics['enob_post_eq'].append(e_eq)
+        metrics['thd_post_eq'].append(t_eq)
+        metrics['sfdr_post_eq'].append(sf_eq)
 
         metrics['sinad_post_nl'].append(s_nl)
         metrics['enob_post_nl'].append(e_nl)
@@ -1886,13 +2649,18 @@ def analyze_and_plot_spectrum(sim, model, scale, device, p_ch0, p_ch1, plot_freq
     plt.ylim(-120, 0)
     plt.legend()
     plt.grid(True)
-    plt.show()
+    save_current_figure(f"spectrum_psd_{plot_freq/1e9:.3f}GHz".replace(".", "p"))
 
 # ==============================================================================
 # Main
 # ==============================================================================
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print("\n=== 运行配置摘要 ===")
+    print(f"ENABLE_STAGE3_NONLINEAR={ENABLE_STAGE3_NONLINEAR} | STAGE3_SCHEME={STAGE3_SCHEME} | STAGE3_USE_REFERENCE_TARGET={STAGE3_USE_REFERENCE_TARGET}")
+    print(f"ENABLE_POST_EQ={ENABLE_POST_EQ} | POST_EQ_USE_REFERENCE_TARGET={POST_EQ_USE_REFERENCE_TARGET} | POST_EQ_BAND_HZ={POST_EQ_BAND_HZ/1e9:.2f}GHz | POST_EQ_TAPS={POST_EQ_TAPS} | POST_EQ_RIDGE={POST_EQ_RIDGE:g}")
+    if not ENABLE_STAGE3_NONLINEAR:
+        print(">> Stage3 已关闭：Post-NL 将与 Post-Linear 完全相同（这是预期行为）")
     sim = TIADCSimulator(fs=20e9)
     # 相对校准
     results = train_relative_calibration(sim, device)
@@ -1920,6 +2688,13 @@ if __name__ == "__main__":
                 f", THD {m['thd_ref'][i]:>7.2f} dBc"
                 f", SFDR {m['sfdr_ref'][i]:>6.2f} dBc"
             )
+        eq_str = ""
+        if hasattr(model, "post_fir") and model.post_fir is not None:
+            eq_str = (
+                f" | Post-EQ: SINAD {m['sinad_post_eq'][i]:>6.2f} dB"
+                f", THD {m['thd_post_eq'][i]:>7.2f} dBc"
+                f", SFDR {m['sfdr_post_eq'][i]:>6.2f} dBc"
+            )
         nl_str = ""
         if 'thd_post_nl' in m:
             nl_str = (
@@ -1933,7 +2708,7 @@ if __name__ == "__main__":
             f"ENOB {m['enob_pre'][i]:>5.2f}->{m['enob_post'][i]:>5.2f} bits | "
             f"THD {m['thd_pre'][i]:>7.2f}->{m['thd_post'][i]:>7.2f} dBc | "
             f"SFDR {m['sfdr_pre'][i]:>6.2f}->{m['sfdr_post'][i]:>6.2f} dBc"
-            f"{ref_str}{nl_str}"
+            f"{ref_str}{eq_str}{nl_str}"
         )
     
     # 绘图
@@ -1943,6 +2718,8 @@ if __name__ == "__main__":
     plt.subplot(4,1,1)
     plt.plot(test_freqs/1e9, m['sinad_pre'], 'r--o', alpha=0.5, label='Pre-Calib')
     plt.plot(test_freqs/1e9, m['sinad_post'], 'g-o', linewidth=2, label='Post-Linear')
+    if hasattr(model, "post_fir") and model.post_fir is not None:
+        plt.plot(test_freqs/1e9, m['sinad_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-EQ')
     if 'sinad_post_nl' in m:
         plt.plot(test_freqs/1e9, m['sinad_post_nl'], 'b--o', alpha=0.85, label='Post-NL')
     plt.title("SINAD Improvement")
@@ -1952,6 +2729,8 @@ if __name__ == "__main__":
     plt.subplot(4,1,2)
     plt.plot(test_freqs/1e9, m['enob_pre'], 'r--o', alpha=0.5, label='Pre-Calib')
     plt.plot(test_freqs/1e9, m['enob_post'], 'm-o', linewidth=2, label='Post-Linear')
+    if hasattr(model, "post_fir") and model.post_fir is not None:
+        plt.plot(test_freqs/1e9, m['enob_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-EQ')
     if 'enob_post_nl' in m:
         plt.plot(test_freqs/1e9, m['enob_post_nl'], 'b--o', alpha=0.85, label='Post-NL')
     plt.title("ENOB Improvement")
@@ -1961,6 +2740,8 @@ if __name__ == "__main__":
     plt.subplot(4,1,3)
     plt.plot(test_freqs/1e9, m['thd_pre'], 'r--o', alpha=0.5, label='Pre-Calib (Ch1 Raw)')
     plt.plot(test_freqs/1e9, m['thd_post'], 'b-o', linewidth=2, label='Post-Linear')
+    if hasattr(model, "post_fir") and model.post_fir is not None:
+        plt.plot(test_freqs/1e9, m['thd_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-EQ')
     if 'thd_post_nl' in m:
         plt.plot(test_freqs/1e9, m['thd_post_nl'], 'k--o', alpha=0.85, label='Post-NL')
     # 可选：画出 Ch0 的 THD 作为基准线 (Target)
@@ -1972,6 +2753,8 @@ if __name__ == "__main__":
     plt.subplot(4,1,4)
     plt.plot(test_freqs/1e9, m['sfdr_pre'], 'r--o', alpha=0.5, label='Pre-Calib (Ch1 Raw)')
     plt.plot(test_freqs/1e9, m['sfdr_post'], 'c-o', linewidth=2, label='Post-Linear')
+    if hasattr(model, "post_fir") and model.post_fir is not None:
+        plt.plot(test_freqs/1e9, m['sfdr_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-EQ')
     if 'sfdr_post_nl' in m:
         plt.plot(test_freqs/1e9, m['sfdr_post_nl'], 'b--o', alpha=0.85, label='Post-NL')
     plt.title("SFDR Improvement")
@@ -1979,4 +2762,4 @@ if __name__ == "__main__":
     plt.xlabel("Frequency (GHz)"); plt.ylabel("dBc"); plt.legend(); plt.grid(True)
     
     plt.tight_layout()
-    plt.show()
+    save_current_figure("metrics_vs_freq")
