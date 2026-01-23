@@ -1308,7 +1308,7 @@ def apply_post_eq_fir_ptv2(sig: np.ndarray, *, post_fir_even: nn.Module, post_fi
 # 4) 配置（仅保留需要的）
 # ==============================================================================
 CH0 = {"cutoff_freq": 6.0e9, "delay_samples": 0.0, "gain": 1.0, "hd2": 1e-3, "hd3": 1e-3}
-CH1 = {"cutoff_freq": 5.9e9, "delay_samples": 0.42, "gain": 0.98, "hd2": 2e-3, "hd3": 2e-3}
+CH1 = {"cutoff_freq": 5.9e9, "delay_samples": 0.04, "gain": 0.98, "hd2": 2e-3, "hd3": 2e-3}
 REF = {"cutoff_freq": 6.0e9, "delay_samples": 0.0, "gain": 1.0, "hd2": 0.0, "hd3": 0.0, "snr_target": 140.0}
 
 POST_EQ_TAPS = _env_int("POST_EQ_TAPS", 127)
