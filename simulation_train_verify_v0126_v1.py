@@ -1,4 +1,1423 @@
 import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy.signal as signal
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+
+# Windows 控制台编码（避免乱码）
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    return default if v is None else int(v)
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    return default if v is None else float(v)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+# plots
+_PLOT_DIR: Optional[Path] = None
+
+
+def _get_plot_dir() -> Path:
+    global _PLOT_DIR
+    if _PLOT_DIR is not None:
+        return _PLOT_DIR
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(__file__).resolve().parent / "plots" / run_ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _PLOT_DIR = out_dir
+    return out_dir
+
+
+def save_current_figure(name: str, *, dpi: int = 200) -> Path:
+    ts_ms = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    out = _get_plot_dir() / f"{ts_ms}_{name}.png"
+    plt.savefig(out, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"[plot] saved: {out}")
+    return out
+
+
+# 真实 ADC 口径
+ADC_JITTER_STD = float(os.getenv("ADC_JITTER_STD", "100e-15"))
+ADC_NBITS = int(os.getenv("ADC_NBITS", "12"))
+
+
+class TIADCSimulator:
+    def __init__(self, fs: float = 20e9):
+        self.fs = float(fs)
+
+    def generate_tone(self, fin: float, *, n: int) -> np.ndarray:
+        t = np.arange(int(n), dtype=np.float64) / self.fs
+        return np.sin(2 * np.pi * float(fin) * t)
+
+    def fractional_delay(self, sig: np.ndarray, delay: float) -> np.ndarray:
+        d = float(delay) % 1.0
+        if abs(d) < 1e-12:
+            return sig
+        k0 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
+        k1 = np.array([-1 / 3, -1 / 2, 1.0, -1 / 6], dtype=np.float64)
+        k2 = np.array([1 / 2, -1.0, 1 / 2, 0.0], dtype=np.float64)
+        k3 = np.array([-1 / 6, 1 / 2, -1 / 2, 1 / 6], dtype=np.float64)
+        xpad = np.pad(sig.astype(np.float64), (1, 2), mode="edge")
+        c0 = np.convolve(xpad, k0[::-1], mode="valid")
+        c1 = np.convolve(xpad, k1[::-1], mode="valid")
+        c2 = np.convolve(xpad, k2[::-1], mode="valid")
+        c3 = np.convolve(xpad, k3[::-1], mode="valid")
+        out = c0 + d * (c1 + d * (c2 + d * c3))
+        return out.astype(sig.dtype, copy=False)
+
+    def apply_channel(
+        self,
+        sig: np.ndarray,
+        *,
+        cutoff_freq: float,
+        delay_samples: float,
+        gain: float = 1.0,
+        jitter_std: float = 100e-15,
+        n_bits: Optional[int] = 12,
+        hd2: float = 0.0,
+        hd3: float = 0.0,
+        snr_target: Optional[float] = None,
+    ) -> np.ndarray:
+        sig = np.asarray(sig, dtype=np.float64)
+        nyq = self.fs / 2.0
+
+        # 静态非线性（简化）
+        sig = sig + float(hd2) * (sig**2) + float(hd3) * (sig**3)
+
+        # 带宽
+        b, a = signal.butter(5, float(cutoff_freq) / nyq, btype="low")
+        sig = signal.lfilter(b, a, sig)
+
+        # 增益+延时
+        sig = sig * float(gain)
+        sig = self.fractional_delay(sig, float(delay_samples))
+
+        # 抖动（斜率近似）
+        if jitter_std and float(jitter_std) > 0:
+            slope = np.gradient(sig) * self.fs
+            dt = np.random.normal(0.0, float(jitter_std), len(sig))
+            sig = sig + slope * dt
+
+        # 噪声
+        if snr_target is not None:
+            p = float(np.mean(sig**2))
+            n_p = p / (10 ** (float(snr_target) / 10.0))
+            sig = sig + np.random.normal(0.0, np.sqrt(n_p), len(sig))
+        else:
+            sig = sig + np.random.normal(0.0, 1e-4, len(sig))
+
+        # 量化
+        if n_bits is None:
+            return sig.astype(np.float64, copy=False)
+        v_range = 2.0
+        levels = 2 ** int(n_bits)
+        step = v_range / levels
+        sig = np.clip(sig, -1.0, 1.0)
+        return (np.round(sig / step) * step).astype(np.float64, copy=False)
+
+
+def interleave_fullrate(c0_full: np.ndarray, c1_full: np.ndarray) -> np.ndarray:
+    s0 = c0_full[0::2]
+    s1 = c1_full[1::2]
+    L = min(len(s0), len(s1))
+    out = np.zeros(2 * L, dtype=np.float64)
+    out[0::2] = s0[:L]
+    out[1::2] = s1[:L]
+    return out
+
+
+class FarrowDelay(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.delay = nn.Parameter(torch.tensor(0.0))
+        k0 = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float32)
+        k1 = torch.tensor([-1 / 3, -1 / 2, 1.0, -1 / 6], dtype=torch.float32)
+        k2 = torch.tensor([1 / 2, -1.0, 1 / 2, 0.0], dtype=torch.float32)
+        k3 = torch.tensor([-1 / 6, 1 / 2, -1 / 2, 1 / 6], dtype=torch.float32)
+        self.register_buffer("k0", k0.view(1, 1, -1))
+        self.register_buffer("k1", k1.view(1, 1, -1))
+        self.register_buffer("k2", k2.view(1, 1, -1))
+        self.register_buffer("k3", k3.view(1, 1, -1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d = torch.remainder(self.delay, 1.0)
+        if torch.all(torch.abs(d) < 1e-9):
+            return x
+        xp = F.pad(x, (1, 2), mode="replicate")
+        c0 = F.conv1d(xp, self.k0)
+        c1 = F.conv1d(xp, self.k1)
+        c2 = F.conv1d(xp, self.k2)
+        c3 = F.conv1d(xp, self.k3)
+        return c0 + d * (c1 + d * (c2 + d * c3))
+
+
+class HybridCalibrationModel(nn.Module):
+    def __init__(self, taps: int = 63):
+        super().__init__()
+        taps = int(taps)
+        if taps % 2 == 0:
+            taps += 1
+        self.gain = nn.Parameter(torch.tensor(1.0))
+        self.global_delay = FarrowDelay()
+        self.conv = nn.Conv1d(1, 1, kernel_size=taps, padding=taps // 2, bias=False)
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            self.conv.weight[0, 0, taps // 2] = 1.0
+        self.post_qe = None
+        self.post_nl = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x * self.gain
+        x = self.global_delay(x)
+        return self.conv(x)
+
+
+class ComplexMSELoss(nn.Module):
+    def forward(self, y_pred: torch.Tensor, y_target: torch.Tensor, model: HybridCalibrationModel) -> torch.Tensor:
+        crop = 300
+        yp = y_pred[..., crop:-crop]
+        yt = y_target[..., crop:-crop]
+        lt = torch.mean((yp - yt) ** 2)
+        Yp = torch.fft.rfft(yp, dim=-1, norm="ortho")
+        Yt = torch.fft.rfft(yt, dim=-1, norm="ortho")
+        lf = torch.mean(torch.abs(Yp - Yt) ** 2)
+        w = model.conv.weight.view(-1)
+        lr = torch.mean((w[1:] - w[:-1]) ** 2)
+        return 100.0 * lt + 100.0 * lf + 0.001 * lr
+
+
+class PhysicalNonlinearityLayer(nn.Module):
+    def __init__(self, *, order: int = 3):
+        super().__init__()
+        self.order = int(order)
+        if self.order < 2:
+            raise ValueError("order must be >=2")
+        self.alpha = float(os.getenv("POST_QE_ALPHA", "0.25"))
+        max_p2 = float(os.getenv("POST_QE_MAX_P2", "8e-3"))
+        max_p3 = float(os.getenv("POST_QE_MAX_P3", "6e-3"))
+        max_hi = float(os.getenv("POST_QE_MAX_PHI", "2e-3"))
+        scales = []
+        for p in range(2, self.order + 1):
+            scales.append(max_p2 if p == 2 else max_p3 if p == 3 else max_hi)
+        self.register_buffer("_scales", torch.tensor(scales, dtype=torch.float32))
+        self.raw_even = nn.Parameter(torch.zeros(self.order - 1, dtype=torch.float32))
+        self.raw_odd = nn.Parameter(torch.zeros(self.order - 1, dtype=torch.float32))
+
+    def _res(self, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+        a = self._scales.to(x.device, x.dtype) * torch.tanh(raw.to(x.device, x.dtype))
+        y = torch.zeros_like(x)
+        for i, p in enumerate(range(2, self.order + 1)):
+            y = y + a[i] * (x**p)
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, -1.0, 1.0)
+        xe = x[..., 0::2]
+        xo = x[..., 1::2]
+        y = x.clone()
+        y[..., 0::2] = xe + float(self.alpha) * self._res(xe, self.raw_even)
+        y[..., 1::2] = xo + float(self.alpha) * self._res(xo, self.raw_odd)
+        return y
+
+
+class DifferentiableMemoryPolynomial(nn.Module):
+    def __init__(self, *, memory_depth: int = 21, nonlinear_order: int = 3):
+        super().__init__()
+        self.K = int(memory_depth)
+        self.P = int(nonlinear_order)
+        if self.K < 1 or self.P < 2:
+            raise ValueError("memory_depth>=1, nonlinear_order>=2 required")
+        self.alpha = float(os.getenv("POST_NL_ALPHA", "0.25"))
+        max_p2 = float(os.getenv("POST_NL_MAX_P2", "8e-3"))
+        max_p3 = float(os.getenv("POST_NL_MAX_P3", "6e-3"))
+        max_hi = float(os.getenv("POST_NL_MAX_PHI", "2e-3"))
+        scales = []
+        for p in range(2, self.P + 1):
+            scales.append(max_p2 if p == 2 else max_p3 if p == 3 else max_hi)
+        self.register_buffer("_scales", torch.tensor(scales, dtype=torch.float32))
+        self.raw_even = nn.Parameter(torch.zeros(self.K, self.P - 1, dtype=torch.float32))
+        self.raw_odd = nn.Parameter(torch.zeros(self.K, self.P - 1, dtype=torch.float32))
+
+    @staticmethod
+    def _delay(x: torch.Tensor, k: int) -> torch.Tensor:
+        if k <= 0:
+            return x
+        xp = F.pad(x, (k, 0), mode="constant", value=0.0)
+        return xp[..., :-k]
+
+    def _res(self, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+        scales = self._scales.to(x.device, x.dtype)
+        raw_t = raw.to(x.device, x.dtype)
+        y = torch.zeros_like(x)
+        for k in range(self.K):
+            xd = self._delay(x, k)
+            a = scales * torch.tanh(raw_t[k, :])
+            for i, p in enumerate(range(2, self.P + 1)):
+                y = y + a[i] * (xd**p)
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, -1.0, 1.0)
+        xe = x[..., 0::2]
+        xo = x[..., 1::2]
+        y = x.clone()
+        y[..., 0::2] = xe + float(self.alpha) * self._res(xe, self.raw_even)
+        y[..., 1::2] = xo + float(self.alpha) * self._res(xo, self.raw_odd)
+        return y
+
+
+def _harm_bins_folded(k: int, n: int, max_h: int = 5) -> list[int]:
+    bins: list[int] = []
+    for h in range(2, max_h + 1):
+        kk = (h * int(k)) % int(n)
+        if kk > n // 2:
+            kk = n - kk
+        if 1 <= kk <= (n // 2 - 1):
+            bins.append(int(kk))
+    return sorted(set(bins))
+
+
+def residual_harmonic_loss(residual: torch.Tensor, target: torch.Tensor, fund_bin: int, *, guard: int = 3) -> torch.Tensor:
+    n = residual.shape[-1]
+    win = torch.hann_window(n, device=residual.device, dtype=residual.dtype).view(1, 1, -1)
+    R = torch.fft.rfft(residual * win, dim=-1, norm="ortho")
+    T = torch.fft.rfft(target * win, dim=-1, norm="ortho")
+    Pr = (R.real**2 + R.imag**2)
+    Pt = (T.real**2 + T.imag**2)
+    eps = 1e-12
+    s0 = max(0, int(fund_bin) - int(guard))
+    e0 = min(Pr.shape[-1], int(fund_bin) + int(guard) + 1)
+    p_fund = torch.sum(Pt[..., s0:e0], dim=-1) + eps
+    p_h = 0.0
+    for kh in _harm_bins_folded(int(fund_bin), int(n), max_h=5):
+        ss = max(0, kh - int(guard))
+        ee = min(Pr.shape[-1], kh + int(guard) + 1)
+        p_h = p_h + torch.sum(Pr[..., ss:ee], dim=-1)
+    p_h = p_h + eps
+    return torch.mean(p_h / p_fund)
+
+
+def train_post_qe(sim: TIADCSimulator, model: HybridCalibrationModel, p0: dict, p1: dict, pref: dict, device: str) -> PhysicalNonlinearityLayer:
+    order = _env_int("POST_QE_ORDER", 3)
+    steps = _env_int("POST_QE_STEPS", 450)
+    lr = _env_float("POST_QE_LR", 5e-4)
+    batch = _env_int("POST_QE_BATCH", 6)
+    n = _env_int("POST_QE_TONE_N", 8192)
+    fmin = _env_float("POST_QE_FMIN_HZ", 0.2e9)
+    fmax = _env_float("POST_QE_FMAX_HZ", 6.2e9)
+    guard = _env_int("POST_QE_GUARD", 3)
+    w_time = _env_float("POST_QE_W_TIME", 10.0)
+    w_harm = _env_float("POST_QE_W_HARM", 450.0)
+    w_fund = _env_float("POST_QE_W_FUND", 8.0)
+    w_delta = _env_float("POST_QE_W_DELTA", 25.0)
+    ridge = _env_float("POST_QE_RIDGE", 2e-4)
+
+    post_qe = PhysicalNonlinearityLayer(order=order).to(device)
+    opt = optim.Adam(post_qe.parameters(), lr=float(lr), betas=(0.5, 0.9))
+    fs = float(sim.fs)
+    t = torch.arange(n, device=device, dtype=torch.float32) / fs
+    k_min = max(int(np.ceil(fmin * n / fs)), 8)
+    k_max = min(int(np.floor(fmax * n / fs)), n // 2 - 8)
+    print(f">> Post-QE: order={order} steps={steps} lr={lr:g} batch={batch} N={n}")
+
+    for step in range(int(steps)):
+        loss_acc = 0.0
+        for _ in range(int(batch)):
+            k = int(np.random.randint(k_min, k_max + 1))
+            fin = float(k) * fs / float(n)
+            amp = float(np.random.uniform(0.4, 0.95))
+            src = torch.sin(2.0 * np.pi * fin * t) * amp
+            src_np = src.detach().cpu().numpy().astype(np.float64)
+
+            y0 = sim.apply_channel(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p0)
+            y1 = sim.apply_channel(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p1)
+            yr = sim.apply_channel(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **pref)
+
+            s12 = max(float(np.max(np.abs(y0))), 1e-12)
+            with torch.no_grad():
+                x1 = torch.FloatTensor(y1 / s12).view(1, 1, -1).to(device)
+                y1c = model(x1).detach().cpu().numpy().flatten() * s12
+
+            xin = interleave_fullrate(y0, y1c)
+            yt = yr[: len(xin)]
+            s0 = max(float(np.max(np.abs(xin))), float(np.max(np.abs(yt))), 1e-12)
+            x = torch.FloatTensor(xin / s0).view(1, 1, -1).to(device)
+            y = torch.FloatTensor(yt / s0).view(1, 1, -1).to(device)
+            x = torch.clamp(x, -1.0, 1.0)
+            y = torch.clamp(y, -1.0, 1.0)
+
+            y_hat = post_qe(x)
+            l_h = residual_harmonic_loss(y_hat - y, y, int(k), guard=guard)
+            win = torch.hann_window(n, device=device, dtype=x.dtype).view(1, 1, -1)
+            Yh = torch.fft.rfft(y_hat * win, dim=-1, norm="ortho")
+            Yr = torch.fft.rfft(y * win, dim=-1, norm="ortho")
+            l_f = torch.mean((torch.log10(torch.abs(Yh[..., int(k)]) + 1e-12) - torch.log10(torch.abs(Yr[..., int(k)]) + 1e-12)) ** 2)
+            l_d = torch.mean((y_hat - x) ** 2)
+            l_t = torch.mean((y_hat - y) ** 2)
+            reg = sum(torch.mean(p**2) for p in post_qe.parameters())
+            loss = w_time * l_t + w_harm * l_h + w_fund * l_f + w_delta * l_d + ridge * reg
+            loss_acc = loss_acc + loss
+
+        loss_acc = loss_acc / float(max(int(batch), 1))
+        opt.zero_grad()
+        loss_acc.backward()
+        torch.nn.utils.clip_grad_norm_(post_qe.parameters(), max_norm=1.0)
+        opt.step()
+        if step % 150 == 0:
+            print(f"Post-QE step {step:4d}/{steps} | loss={loss_acc.item():.3e}")
+
+    return post_qe
+
+
+def train_post_nl(sim: TIADCSimulator, model: HybridCalibrationModel, p0: dict, p1: dict, pref: dict, device: str) -> DifferentiableMemoryPolynomial:
+    taps = _env_int("STAGE3_TAPS", 21)
+    order = _env_int("STAGE3_ORDER", 3)
+    steps = _env_int("STAGE3_STEPS", 1200)
+    lr = _env_float("STAGE3_LR", 4e-4)
+    batch = _env_int("STAGE3_BATCH", 9)
+    n = _env_int("STAGE3_TONE_N", 16384)
+    fmin = _env_float("STAGE3_FMIN_HZ", 0.2e9)
+    fmax = _env_float("STAGE3_FMAX_HZ", 6.2e9)
+    guard = _env_int("STAGE3_HARM_GUARD", 3)
+    w_time = _env_float("STAGE3_W_TIME", 40.0)
+    w_harm = _env_float("STAGE3_W_HARM", 600.0)
+    w_fund = _env_float("STAGE3_W_FUND", 6.0)
+    w_delta = _env_float("STAGE3_W_DELTA", 8.0)
+    w_reg = _env_float("STAGE3_W_REG", 2e-4)
+
+    post_nl = DifferentiableMemoryPolynomial(memory_depth=taps, nonlinear_order=order).to(device)
+    opt = optim.Adam(post_nl.parameters(), lr=float(lr), betas=(0.5, 0.9))
+    fs = float(sim.fs)
+    t = torch.arange(n, device=device, dtype=torch.float32) / fs
+    k_min = max(int(np.ceil(fmin * n / fs)), 8)
+    k_max = min(int(np.floor(fmax * n / fs)), n // 2 - 8)
+    print(f">> Post-NL: taps={taps} order={order} steps={steps} lr={lr:g} batch={batch} N={n}")
+
+    for step in range(int(steps)):
+        loss_acc = 0.0
+        for _ in range(int(batch)):
+            k = int(np.random.randint(k_min, k_max + 1))
+            fin = float(k) * fs / float(n)
+            amp = float(np.random.uniform(0.4, 0.95))
+            src = torch.sin(2.0 * np.pi * fin * t) * amp
+            src_np = src.detach().cpu().numpy().astype(np.float64)
+
+            y0 = sim.apply_channel(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p0)
+            y1 = sim.apply_channel(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p1)
+            yr = sim.apply_channel(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **pref)
+
+            s12 = max(float(np.max(np.abs(y0))), 1e-12)
+            with torch.no_grad():
+                x1 = torch.FloatTensor(y1 / s12).view(1, 1, -1).to(device)
+                y1c = model(x1).detach().cpu().numpy().flatten() * s12
+
+            xin = interleave_fullrate(y0, y1c)
+            yt = yr[: len(xin)]
+            s0 = max(float(np.max(np.abs(xin))), float(np.max(np.abs(yt))), 1e-12)
+            x = torch.FloatTensor(xin / s0).view(1, 1, -1).to(device)
+            y = torch.FloatTensor(yt / s0).view(1, 1, -1).to(device)
+            x = torch.clamp(x, -1.0, 1.0)
+            y = torch.clamp(y, -1.0, 1.0)
+
+            if model.post_qe is not None:
+                with torch.no_grad():
+                    x = model.post_qe(x)
+
+            y_hat = post_nl(x)
+            l_h = residual_harmonic_loss(y_hat - y, y, int(k), guard=guard)
+            win = torch.hann_window(n, device=device, dtype=x.dtype).view(1, 1, -1)
+            Yh = torch.fft.rfft(y_hat * win, dim=-1, norm="ortho")
+            Yr = torch.fft.rfft(y * win, dim=-1, norm="ortho")
+            l_f = torch.mean((torch.log10(torch.abs(Yh[..., int(k)]) + 1e-12) - torch.log10(torch.abs(Yr[..., int(k)]) + 1e-12)) ** 2)
+            l_d = torch.mean((y_hat - x) ** 2)
+            l_t = torch.mean((y_hat - y) ** 2)
+            reg = sum(torch.mean(p**2) for p in post_nl.parameters())
+            loss = w_time * l_t + w_harm * l_h + w_fund * l_f + w_delta * l_d + w_reg * reg
+            loss_acc = loss_acc + loss
+
+        loss_acc = loss_acc / float(max(int(batch), 1))
+        opt.zero_grad()
+        loss_acc.backward()
+        torch.nn.utils.clip_grad_norm_(post_nl.parameters(), max_norm=1.0)
+        opt.step()
+        if step % 150 == 0:
+            w_mean = float(torch.mean(torch.stack([p.abs().mean() for p in post_nl.parameters()])).detach().cpu())
+            print(f"Post-NL step {step:4d}/{steps} | loss={loss_acc.item():.3e} | w_mean~{w_mean:.2e}")
+
+    return post_nl
+
+
+def train_all(sim: TIADCSimulator, *, device: str):
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    p0 = {"cutoff_freq": 8.0e9, "delay_samples": 0.0, "gain": 1.0, "hd2": 1e-3, "hd3": 0.5e-3}
+    p1 = {"cutoff_freq": 7.8e9, "delay_samples": 0.25, "gain": 0.98, "hd2": 5e-3, "hd3": 3e-3}
+    pref = {"cutoff_freq": p0["cutoff_freq"], "delay_samples": 0.0, "gain": 1.0, "hd2": 0.0, "hd3": 0.0, "snr_target": None}
+
+    # Stage1/2 训练：带限噪声 + 平均
+    n_train = 32768
+    m_avg = 16
+    white = np.random.randn(n_train)
+    b, a = signal.butter(6, 7.0e9 / (sim.fs / 2), btype="low")
+    base = signal.lfilter(b, a, white)
+    base = base / np.max(np.abs(base)) * 0.9
+
+    caps0, caps1 = [], []
+    for _ in range(m_avg):
+        caps0.append(sim.apply_channel(base, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p0))
+        caps1.append(sim.apply_channel(base, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p1))
+    avg0 = np.mean(np.stack(caps0), axis=0)
+    avg1 = np.mean(np.stack(caps1), axis=0)
+
+    scale = max(float(np.max(np.abs(avg0))), 1e-12)
+    inp = torch.FloatTensor(avg1 / scale).view(1, 1, -1).to(device)
+    tgt = torch.FloatTensor(avg0 / scale).view(1, 1, -1).to(device)
+
+    model = HybridCalibrationModel(taps=63).to(device)
+    loss_fn = ComplexMSELoss()
+
+    print("=== Stage 1: Relative Delay & Gain ===")
+    opt1 = optim.Adam(
+        [
+            {"params": model.global_delay.parameters(), "lr": 1e-2},
+            {"params": model.gain, "lr": 1e-2},
+            {"params": model.conv.parameters(), "lr": 0.0},
+        ]
+    )
+    for _ in range(301):
+        opt1.zero_grad()
+        loss = loss_fn(model(inp), tgt, model)
+        loss.backward()
+        opt1.step()
+
+    print("=== Stage 2: Relative FIR ===")
+    opt2 = optim.Adam(
+        [
+            {"params": model.global_delay.parameters(), "lr": 0.0},
+            {"params": model.gain, "lr": 0.0},
+            {"params": model.conv.parameters(), "lr": 5e-4},
+        ],
+        betas=(0.5, 0.9),
+    )
+    for _ in range(1001):
+        opt2.zero_grad()
+        loss = loss_fn(model(inp), tgt, model)
+        loss.backward()
+        opt2.step()
+
+    if _env_bool("ENABLE_POST_QE", True):
+        model.post_qe = train_post_qe(sim, model, p0, p1, pref, device)
+    if _env_bool("ENABLE_STAGE3_NONLINEAR", True):
+        model.post_nl = train_post_nl(sim, model, p0, p1, pref, device)
+    return model, scale, p0, p1
+
+
+def calc_metrics(sig: np.ndarray, fs: float, fin: float):
+    sig = np.asarray(sig, dtype=np.float64)
+    n = len(sig)
+    win = np.blackman(n)
+    cg = float(np.mean(win))
+    S = np.fft.rfft(sig * win)
+    mag = np.abs(S) / (n / 2 * cg + 1e-20)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    idx = int(np.argmin(np.abs(freqs - fin)))
+    span = 5
+    s0 = max(0, idx - span)
+    e0 = min(len(mag), idx + span + 1)
+    idxp = s0 + int(np.argmax(mag[s0:e0]))
+    p_fund = float(mag[idxp] ** 2) + 1e-30
+    mask = np.ones_like(mag, dtype=bool)
+    mask[:5] = False
+    mask[max(0, idxp - span) : min(len(mask), idxp + span + 1)] = False
+    p_nd = float(np.sum(mag[mask] ** 2)) + 1e-30
+    sinad = 10.0 * np.log10(p_fund / p_nd)
+    enob = (sinad - 1.76) / 6.02
+    p_spur = float(np.max(mag[mask] ** 2)) if np.any(mask) else 1e-30
+    sfdr = 10.0 * np.log10(p_fund / (p_spur + 1e-30))
+    p_h = 0.0
+    for h in range(2, 6):
+        hf = (fin * h) % fs
+        if hf > fs / 2:
+            hf = fs - hf
+        if hf < 1e6 or hf > fs / 2 - 1e6:
+            continue
+        k = int(np.argmin(np.abs(freqs - hf)))
+        ss = max(0, k - span)
+        ee = min(len(mag), k + span + 1)
+        kk = ss + int(np.argmax(mag[ss:ee]))
+        p_h += float(mag[kk] ** 2)
+    thd = 10.0 * np.log10((p_h + 1e-30) / p_fund)
+    return float(sinad), float(enob), float(thd), float(sfdr)
+
+
+def evaluate(sim: TIADCSimulator, model: HybridCalibrationModel, scale: float, device: str, p0: dict, p1: dict):
+    freqs = np.arange(0.1e9, 6.6e9, 0.2e9)
+    m = {k: [] for k in ["sinad_pre", "sinad_post", "sinad_qe", "sinad_nl",
+                         "enob_pre", "enob_post", "enob_qe", "enob_nl",
+                         "thd_pre", "thd_post", "thd_qe", "thd_nl",
+                         "sfdr_pre", "sfdr_post", "sfdr_qe", "sfdr_nl"]}
+    for f in freqs:
+        src = sim.generate_tone(float(f), n=16384) * 0.9
+        y0 = sim.apply_channel(src, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p0)
+        y1 = sim.apply_channel(src, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p1)
+        with torch.no_grad():
+            x1 = torch.FloatTensor(y1 / float(scale)).view(1, 1, -1).to(device)
+            y1c = model(x1).cpu().numpy().flatten() * float(scale)
+        margin = 500
+        c0 = y0[margin:-margin]
+        c1r = y1[margin:-margin]
+        c1c = y1c[margin:-margin]
+        pre = interleave_fullrate(c0, c1r)
+        post = interleave_fullrate(c0, c1c)
+        qe = post
+        if model.post_qe is not None:
+            s = max(float(np.max(np.abs(post))), 1e-12)
+            with torch.no_grad():
+                x = torch.FloatTensor(post / s).view(1, 1, -1).to(device)
+                qe = model.post_qe(x).cpu().numpy().flatten() * s
+        nl = qe
+        if model.post_nl is not None:
+            s = max(float(np.max(np.abs(qe))), 1e-12)
+            with torch.no_grad():
+                x = torch.FloatTensor(qe / s).view(1, 1, -1).to(device)
+                nl = model.post_nl(x).cpu().numpy().flatten() * s
+        s0, e0, t0, sf0 = calc_metrics(pre, sim.fs, float(f))
+        s1, e1, t1, sf1 = calc_metrics(post, sim.fs, float(f))
+        s2, e2, t2, sf2 = calc_metrics(qe, sim.fs, float(f))
+        s3, e3, t3, sf3 = calc_metrics(nl, sim.fs, float(f))
+        m["sinad_pre"].append(s0); m["sinad_post"].append(s1); m["sinad_qe"].append(s2); m["sinad_nl"].append(s3)
+        m["enob_pre"].append(e0); m["enob_post"].append(e1); m["enob_qe"].append(e2); m["enob_nl"].append(e3)
+        m["thd_pre"].append(t0); m["thd_post"].append(t1); m["thd_qe"].append(t2); m["thd_nl"].append(t3)
+        m["sfdr_pre"].append(sf0); m["sfdr_post"].append(sf1); m["sfdr_qe"].append(sf2); m["sfdr_nl"].append(sf3)
+    return freqs, m
+
+
+def plot_metrics(freqs: np.ndarray, m: dict):
+    fghz = freqs / 1e9
+    plt.figure(figsize=(10, 13))
+    plt.subplot(4, 1, 1)
+    plt.plot(fghz, m["sinad_pre"], "r--o", alpha=0.5, label="Pre-Calib")
+    plt.plot(fghz, m["sinad_post"], "g-o", linewidth=2, label="Post-Linear")
+    plt.plot(fghz, m["sinad_qe"], color="#ff7f0e", marker="o", linewidth=2, label="Post-QE")
+    plt.plot(fghz, m["sinad_nl"], "b--o", alpha=0.85, label="Post-NL")
+    plt.title("SINAD Improvement"); plt.ylabel("dB"); plt.legend(); plt.grid(True)
+    plt.subplot(4, 1, 2)
+    plt.plot(fghz, m["enob_pre"], "r--o", alpha=0.5, label="Pre-Calib")
+    plt.plot(fghz, m["enob_post"], "m-o", linewidth=2, label="Post-Linear")
+    plt.plot(fghz, m["enob_qe"], color="#ff7f0e", marker="o", linewidth=2, label="Post-QE")
+    plt.plot(fghz, m["enob_nl"], "b--o", alpha=0.85, label="Post-NL")
+    plt.title("ENOB Improvement"); plt.ylabel("Bits"); plt.legend(); plt.grid(True)
+    plt.subplot(4, 1, 3)
+    plt.plot(fghz, m["thd_pre"], "r--o", alpha=0.5, label="Pre-Calib")
+    plt.plot(fghz, m["thd_post"], "b-o", linewidth=2, label="Post-Linear")
+    plt.plot(fghz, m["thd_qe"], color="#ff7f0e", marker="o", linewidth=2, label="Post-QE")
+    plt.plot(fghz, m["thd_nl"], "k--o", alpha=0.85, label="Post-NL")
+    plt.title("THD Comparison"); plt.ylabel("dBc"); plt.legend(); plt.grid(True)
+    plt.subplot(4, 1, 4)
+    plt.plot(fghz, m["sfdr_pre"], "r--o", alpha=0.5, label="Pre-Calib")
+    plt.plot(fghz, m["sfdr_post"], "c-o", linewidth=2, label="Post-Linear")
+    plt.plot(fghz, m["sfdr_qe"], color="#ff7f0e", marker="o", linewidth=2, label="Post-QE")
+    plt.plot(fghz, m["sfdr_nl"], "b--o", alpha=0.85, label="Post-NL")
+    plt.title("SFDR Improvement"); plt.xlabel("Frequency (GHz)"); plt.ylabel("dBc"); plt.legend(); plt.grid(True)
+    plt.tight_layout()
+    save_current_figure("metrics_vs_freq")
+
+
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("\n=== 运行配置摘要 ===")
+    print(f"device={device} | ENABLE_POST_QE={_env_bool('ENABLE_POST_QE', True)} | ENABLE_STAGE3_NONLINEAR={_env_bool('ENABLE_STAGE3_NONLINEAR', True)}")
+    sim = TIADCSimulator(fs=20e9)
+    model, scale, p0, p1 = train_all(sim, device=device)
+    freqs, m = evaluate(sim, model, scale, device, p0, p1)
+    print("\n=== 关键频点（Pre -> Linear -> Post-QE -> Post-NL）===")
+    for g in [0.1, 1.5, 3.0, 4.5, 5.5, 6.0, 6.5]:
+        i = int(np.argmin(np.abs(freqs - g * 1e9)))
+        print(
+            f"f={freqs[i]/1e9:>4.1f}GHz | "
+            f"SINAD {m['sinad_pre'][i]:>6.2f}->{m['sinad_post'][i]:>6.2f}->{m['sinad_qe'][i]:>6.2f}->{m['sinad_nl'][i]:>6.2f} dB | "
+            f"THD {m['thd_pre'][i]:>7.2f}->{m['thd_post'][i]:>7.2f}->{m['thd_qe'][i]:>7.2f}->{m['thd_nl'][i]:>7.2f} dBc | "
+            f"SFDR {m['sfdr_pre'][i]:>6.2f}->{m['sfdr_post'][i]:>6.2f}->{m['sfdr_qe'][i]:>6.2f}->{m['sfdr_nl'][i]:>6.2f} dBc"
+        )
+    plot_metrics(freqs, m)
+    raise SystemExit(0)
+
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy.signal as signal
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+
+# ----------------------------
+# 控制台编码（Windows 防乱码）
+# ----------------------------
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
+# ----------------------------
+# env helpers
+# ----------------------------
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    return default if v is None else int(v)
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    return default if v is None else float(v)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+# ----------------------------
+# plots
+# ----------------------------
+_PLOT_DIR: Optional[Path] = None
+
+
+def _get_plot_dir() -> Path:
+    global _PLOT_DIR
+    if _PLOT_DIR is not None:
+        return _PLOT_DIR
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(__file__).resolve().parent / "plots" / run_ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _PLOT_DIR = out_dir
+    return out_dir
+
+
+def save_current_figure(name: str, *, dpi: int = 200) -> Path:
+    ts_ms = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    out = _get_plot_dir() / f"{ts_ms}_{name}.png"
+    plt.savefig(out, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"[plot] saved: {out}")
+    return out
+
+
+# ----------------------------
+# 真实口径
+# ----------------------------
+ADC_JITTER_STD = float(os.getenv("ADC_JITTER_STD", "100e-15"))
+ADC_NBITS = int(os.getenv("ADC_NBITS", "12"))
+
+
+# ==============================================================================
+# Simulator
+# ==============================================================================
+class TIADCSimulator:
+    def __init__(self, fs: float = 20e9):
+        self.fs = float(fs)
+
+    def generate_tone_data(self, f_in: float, *, N: int) -> np.ndarray:
+        n = np.arange(int(N), dtype=np.float64)
+        return np.sin(2.0 * np.pi * float(f_in) * n / self.fs).astype(np.float64)
+
+    def fractional_delay(self, sig: np.ndarray, delay: float) -> np.ndarray:
+        d = float(delay) % 1.0
+        if abs(d) < 1e-12:
+            return sig
+        k0 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
+        k1 = np.array([-1 / 3, -1 / 2, 1.0, -1 / 6], dtype=np.float64)
+        k2 = np.array([1 / 2, -1.0, 1 / 2, 0.0], dtype=np.float64)
+        k3 = np.array([-1 / 6, 1 / 2, -1 / 2, 1 / 6], dtype=np.float64)
+        xpad = np.pad(sig.astype(np.float64), (1, 2), mode="edge")
+        c0 = np.convolve(xpad, k0[::-1], mode="valid")
+        c1 = np.convolve(xpad, k1[::-1], mode="valid")
+        c2 = np.convolve(xpad, k2[::-1], mode="valid")
+        c3 = np.convolve(xpad, k3[::-1], mode="valid")
+        out = c0 + d * (c1 + d * (c2 + d * c3))
+        return out.astype(sig.dtype, copy=False)
+
+    def apply_channel_effect(
+        self,
+        sig: np.ndarray,
+        *,
+        cutoff_freq: float,
+        delay_samples: float,
+        gain: float = 1.0,
+        jitter_std: float = 100e-15,
+        n_bits: Optional[int] = 12,
+        hd2: float = 0.0,
+        hd3: float = 0.0,
+        snr_target: Optional[float] = None,
+    ) -> np.ndarray:
+        sig = np.asarray(sig, dtype=np.float64)
+        nyq = self.fs / 2.0
+
+        sig_nl = sig + float(hd2) * (sig**2) + float(hd3) * (sig**3)
+        b, a = signal.butter(5, float(cutoff_freq) / nyq, btype="low")
+        sig_bw = signal.lfilter(b, a, sig_nl)
+        sig_g = sig_bw * float(gain)
+        sig_d = self.fractional_delay(sig_g, float(delay_samples))
+
+        if jitter_std and float(jitter_std) > 0:
+            slope = np.gradient(sig_d) * self.fs
+            dt = np.random.normal(0.0, float(jitter_std), len(sig_d))
+            sig_j = sig_d + slope * dt
+        else:
+            sig_j = sig_d
+
+        if snr_target is not None:
+            p = float(np.mean(sig_j**2))
+            n_p = p / (10 ** (float(snr_target) / 10.0))
+            thermal = np.random.normal(0.0, np.sqrt(n_p), len(sig_j))
+        else:
+            thermal = np.random.normal(0.0, 1e-4, len(sig_j))
+        sig_n = sig_j + thermal
+
+        if n_bits is None:
+            return sig_n.astype(np.float64, copy=False)
+        v_range = 2.0
+        levels = 2 ** int(n_bits)
+        step = v_range / levels
+        sig_clip = np.clip(sig_n, -1.0, 1.0)
+        return (np.round(sig_clip / step) * step).astype(np.float64, copy=False)
+
+
+# ==============================================================================
+# Stage1/2 model
+# ==============================================================================
+class FarrowDelay(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.delay = nn.Parameter(torch.tensor(0.0))
+        k0 = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float32)
+        k1 = torch.tensor([-1 / 3, -1 / 2, 1.0, -1 / 6], dtype=torch.float32)
+        k2 = torch.tensor([1 / 2, -1.0, 1 / 2, 0.0], dtype=torch.float32)
+        k3 = torch.tensor([-1 / 6, 1 / 2, -1 / 2, 1 / 6], dtype=torch.float32)
+        self.register_buffer("k0", k0.view(1, 1, -1))
+        self.register_buffer("k1", k1.view(1, 1, -1))
+        self.register_buffer("k2", k2.view(1, 1, -1))
+        self.register_buffer("k3", k3.view(1, 1, -1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d = torch.remainder(self.delay, 1.0)
+        if torch.all(torch.abs(d) < 1e-9):
+            return x
+        xp = F.pad(x, (1, 2), mode="replicate")
+        c0 = F.conv1d(xp, self.k0)
+        c1 = F.conv1d(xp, self.k1)
+        c2 = F.conv1d(xp, self.k2)
+        c3 = F.conv1d(xp, self.k3)
+        return c0 + d * (c1 + d * (c2 + d * c3))
+
+
+class HybridCalibrationModel(nn.Module):
+    def __init__(self, taps: int = 63):
+        super().__init__()
+        taps = int(taps)
+        if taps % 2 == 0:
+            taps += 1
+        self.gain = nn.Parameter(torch.tensor(1.0))
+        self.global_delay = FarrowDelay()
+        self.conv = nn.Conv1d(1, 1, kernel_size=taps, padding=taps // 2, bias=False)
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            self.conv.weight[0, 0, taps // 2] = 1.0
+
+        self.post_qe = None
+        self.post_nl = None
+        self.reference_params = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x * self.gain
+        x = self.global_delay(x)
+        return self.conv(x)
+
+
+class ComplexMSELoss(nn.Module):
+    def forward(self, y_pred: torch.Tensor, y_target: torch.Tensor, model: HybridCalibrationModel) -> torch.Tensor:
+        crop = 300
+        yp = y_pred[..., crop:-crop]
+        yt = y_target[..., crop:-crop]
+        loss_time = torch.mean((yp - yt) ** 2)
+        Yp = torch.fft.rfft(yp, dim=-1, norm="ortho")
+        Yt = torch.fft.rfft(yt, dim=-1, norm="ortho")
+        loss_freq = torch.mean(torch.abs(Yp - Yt) ** 2)
+        w = model.conv.weight.view(-1)
+        loss_reg = torch.mean((w[1:] - w[:-1]) ** 2)
+        return 100.0 * loss_time + 100.0 * loss_freq + 0.001 * loss_reg
+
+
+def interleave_fullrate(c0_full: np.ndarray, c1_full: np.ndarray) -> np.ndarray:
+    s0 = c0_full[0::2]
+    s1 = c1_full[1::2]
+    L = min(len(s0), len(s1))
+    out = np.zeros(2 * L, dtype=np.float64)
+    out[0::2] = s0[:L]
+    out[1::2] = s1[:L]
+    return out
+
+
+# ==============================================================================
+# Post-QE / Post-NL layers (residual + bounded)
+# ==============================================================================
+class PhysicalNonlinearityLayer(nn.Module):
+    def __init__(self, *, order: int = 3):
+        super().__init__()
+        self.order = int(order)
+        if self.order < 2:
+            raise ValueError("order must be >= 2")
+        self.alpha = float(os.getenv("POST_QE_ALPHA", "0.25"))
+        max_p2 = float(os.getenv("POST_QE_MAX_P2", "8e-3"))
+        max_p3 = float(os.getenv("POST_QE_MAX_P3", "6e-3"))
+        max_hi = float(os.getenv("POST_QE_MAX_PHI", "2e-3"))
+        scales = []
+        for p in range(2, self.order + 1):
+            scales.append(max_p2 if p == 2 else max_p3 if p == 3 else max_hi)
+        self.register_buffer("_scales", torch.tensor(scales, dtype=torch.float32))
+        self.raw_even = nn.Parameter(torch.zeros(self.order - 1, dtype=torch.float32))
+        self.raw_odd = nn.Parameter(torch.zeros(self.order - 1, dtype=torch.float32))
+
+    def _res(self, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+        a = self._scales.to(x.device, x.dtype) * torch.tanh(raw.to(x.device, x.dtype))
+        y = torch.zeros_like(x)
+        for i, p in enumerate(range(2, self.order + 1)):
+            y = y + a[i] * (x ** p)
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, -1.0, 1.0)
+        xe = x[..., 0::2]
+        xo = x[..., 1::2]
+        y = x.clone()
+        y[..., 0::2] = xe + float(self.alpha) * self._res(xe, self.raw_even)
+        y[..., 1::2] = xo + float(self.alpha) * self._res(xo, self.raw_odd)
+        return y
+
+
+class DifferentiableMemoryPolynomial(nn.Module):
+    def __init__(self, *, memory_depth: int = 21, nonlinear_order: int = 3):
+        super().__init__()
+        self.K = int(memory_depth)
+        self.P = int(nonlinear_order)
+        if self.K < 1 or self.P < 2:
+            raise ValueError("memory_depth>=1 and nonlinear_order>=2 required")
+        self.alpha = float(os.getenv("POST_NL_ALPHA", "0.25"))
+        max_p2 = float(os.getenv("POST_NL_MAX_P2", "8e-3"))
+        max_p3 = float(os.getenv("POST_NL_MAX_P3", "6e-3"))
+        max_hi = float(os.getenv("POST_NL_MAX_PHI", "2e-3"))
+        scales = []
+        for p in range(2, self.P + 1):
+            scales.append(max_p2 if p == 2 else max_p3 if p == 3 else max_hi)
+        self.register_buffer("_scales", torch.tensor(scales, dtype=torch.float32))  # (P-1,)
+        self.raw_even = nn.Parameter(torch.zeros(self.K, self.P - 1, dtype=torch.float32))
+        self.raw_odd = nn.Parameter(torch.zeros(self.K, self.P - 1, dtype=torch.float32))
+
+    @staticmethod
+    def _delay(x: torch.Tensor, k: int) -> torch.Tensor:
+        if k <= 0:
+            return x
+        xp = F.pad(x, (k, 0), mode="constant", value=0.0)
+        return xp[..., :-k]
+
+    def _res(self, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+        scales = self._scales.to(x.device, x.dtype)
+        raw_t = raw.to(x.device, x.dtype)
+        y = torch.zeros_like(x)
+        for k in range(self.K):
+            xd = self._delay(x, k)
+            a = scales * torch.tanh(raw_t[k, :])
+            for i, p in enumerate(range(2, self.P + 1)):
+                y = y + a[i] * (xd ** p)
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, -1.0, 1.0)
+        xe = x[..., 0::2]
+        xo = x[..., 1::2]
+        y = x.clone()
+        y[..., 0::2] = xe + float(self.alpha) * self._res(xe, self.raw_even)
+        y[..., 1::2] = xo + float(self.alpha) * self._res(xo, self.raw_odd)
+        return y
+
+
+# ==============================================================================
+# Loss helpers
+# ==============================================================================
+def _harm_bins_folded(k: int, N: int, max_h: int = 5) -> list[int]:
+    bins: list[int] = []
+    for h in range(2, max_h + 1):
+        kk = (h * int(k)) % int(N)
+        if kk > N // 2:
+            kk = N - kk
+        if 1 <= kk <= (N // 2 - 1):
+            bins.append(int(kk))
+    return sorted(set(bins))
+
+
+def residual_harmonic_loss_torch(residual: torch.Tensor, target: torch.Tensor, fund_bin: int, *, max_h: int = 5, guard: int = 3) -> torch.Tensor:
+    n = residual.shape[-1]
+    win = torch.hann_window(n, device=residual.device, dtype=residual.dtype).view(1, 1, -1)
+    R = torch.fft.rfft(residual * win, dim=-1, norm="ortho")
+    T = torch.fft.rfft(target * win, dim=-1, norm="ortho")
+    Pr = (R.real**2 + R.imag**2)
+    Pt = (T.real**2 + T.imag**2)
+    eps = 1e-12
+    s0 = max(0, int(fund_bin) - int(guard))
+    e0 = min(Pr.shape[-1], int(fund_bin) + int(guard) + 1)
+    p_fund = torch.sum(Pt[..., s0:e0], dim=-1) + eps
+    p_h = 0.0
+    for kh in _harm_bins_folded(int(fund_bin), int(n), max_h=int(max_h)):
+        ss = max(0, kh - int(guard))
+        ee = min(Pr.shape[-1], kh + int(guard) + 1)
+        p_h = p_h + torch.sum(Pr[..., ss:ee], dim=-1)
+    p_h = p_h + eps
+    return torch.mean(p_h / p_fund)
+
+
+# ==============================================================================
+# Training
+# ==============================================================================
+def train_post_qe(
+    *,
+    sim: TIADCSimulator,
+    model: HybridCalibrationModel,
+    params_ch0: dict,
+    params_ch1: dict,
+    params_ref: dict,
+    scale_ref: float,
+    device: str,
+) -> PhysicalNonlinearityLayer:
+    qe_order = _env_int("POST_QE_ORDER", 3)
+    steps = _env_int("POST_QE_STEPS", 450)
+    lr = _env_float("POST_QE_LR", 5e-4)
+    batch = _env_int("POST_QE_BATCH", 6)
+    N = _env_int("POST_QE_TONE_N", 8192)
+    fmin = _env_float("POST_QE_FMIN_HZ", 0.2e9)
+    fmax = _env_float("POST_QE_FMAX_HZ", 6.2e9)
+    guard = _env_int("POST_QE_GUARD", 3)
+    w_time = _env_float("POST_QE_W_TIME", 10.0)
+    w_harm = _env_float("POST_QE_W_HARM", 450.0)
+    w_fund = _env_float("POST_QE_W_FUND", 8.0)
+    w_delta = _env_float("POST_QE_W_DELTA", 25.0)
+    ridge = _env_float("POST_QE_RIDGE", 2e-4)
+
+    post_qe = PhysicalNonlinearityLayer(order=qe_order).to(device)
+    opt = optim.Adam(post_qe.parameters(), lr=float(lr), betas=(0.5, 0.9))
+    fs = float(sim.fs)
+    t = torch.arange(N, device=device, dtype=torch.float32) / fs
+    k_min = max(int(np.ceil(fmin * N / fs)), 8)
+    k_max = min(int(np.floor(fmax * N / fs)), N // 2 - 8)
+
+    print(f">> Post-QE: order={qe_order} steps={steps} lr={lr:g} batch={batch} N={N}")
+    for step in range(int(steps)):
+        loss_acc = 0.0
+        for _ in range(int(batch)):
+            k = int(np.random.randint(k_min, k_max + 1))
+            fin = float(k) * fs / float(N)
+            amp = float(np.random.uniform(0.4, 0.95))
+            src = torch.sin(2.0 * np.pi * fin * t) * amp
+            src_np = src.detach().cpu().numpy().astype(np.float64)
+
+            y0 = sim.apply_channel_effect(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch0)
+            y1 = sim.apply_channel_effect(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch1)
+            yr = sim.apply_channel_effect(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ref)
+
+            s12 = max(float(np.max(np.abs(y0))), 1e-12)
+            with torch.no_grad():
+                x1 = torch.FloatTensor(y1 / s12).view(1, 1, -1).to(device)
+                y1c = model(x1).detach().cpu().numpy().flatten() * s12
+
+            tiadc_in = interleave_fullrate(y0, y1c)
+            target = yr[: len(tiadc_in)]
+            s0 = max(float(np.max(np.abs(tiadc_in))), float(np.max(np.abs(target))), 1e-12)
+            x = torch.FloatTensor(tiadc_in / s0).view(1, 1, -1).to(device)
+            y = torch.FloatTensor(target / s0).view(1, 1, -1).to(device)
+            x = torch.clamp(x, -1.0, 1.0)
+            y = torch.clamp(y, -1.0, 1.0)
+
+            y_hat = post_qe(x)
+            loss_h = residual_harmonic_loss_torch(y_hat - y, y, int(k), guard=guard)
+            win = torch.hann_window(N, device=device, dtype=x.dtype).view(1, 1, -1)
+            Yh = torch.fft.rfft(y_hat * win, dim=-1, norm="ortho")
+            Yr = torch.fft.rfft(y * win, dim=-1, norm="ortho")
+            loss_f = torch.mean((torch.log10(torch.abs(Yh[..., int(k)]) + 1e-12) - torch.log10(torch.abs(Yr[..., int(k)]) + 1e-12)) ** 2)
+            loss_d = torch.mean((y_hat - x) ** 2)
+            loss_t = torch.mean((y_hat - y) ** 2)
+            reg = sum(torch.mean(p**2) for p in post_qe.parameters())
+
+            loss = w_time * loss_t + w_harm * loss_h + w_fund * loss_f + w_delta * loss_d + ridge * reg
+            loss_acc = loss_acc + loss
+
+        loss_acc = loss_acc / float(max(int(batch), 1))
+        opt.zero_grad()
+        loss_acc.backward()
+        torch.nn.utils.clip_grad_norm_(post_qe.parameters(), max_norm=1.0)
+        opt.step()
+        if step % 150 == 0:
+            print(f"Post-QE step {step:4d}/{steps} | loss={loss_acc.item():.3e}")
+
+    return post_qe
+
+
+def train_post_nl(
+    *,
+    sim: TIADCSimulator,
+    model: HybridCalibrationModel,
+    params_ch0: dict,
+    params_ch1: dict,
+    params_ref: dict,
+    scale_ref: float,
+    device: str,
+) -> DifferentiableMemoryPolynomial:
+    taps = _env_int("STAGE3_TAPS", 21)
+    order = _env_int("STAGE3_ORDER", 3)
+    steps = _env_int("STAGE3_STEPS", 1200)
+    lr = _env_float("STAGE3_LR", 4e-4)
+    batch = _env_int("STAGE3_BATCH", 9)
+    N = _env_int("STAGE3_TONE_N", 16384)
+    fmin = _env_float("STAGE3_FMIN_HZ", 0.2e9)
+    fmax = _env_float("STAGE3_FMAX_HZ", 6.2e9)
+    guard = _env_int("STAGE3_HARM_GUARD", 3)
+    w_time = _env_float("STAGE3_W_TIME", 40.0)
+    w_harm = _env_float("STAGE3_W_HARM", 600.0)
+    w_fund = _env_float("STAGE3_W_FUND", 6.0)
+    w_delta = _env_float("STAGE3_W_DELTA", 8.0)
+    w_reg = _env_float("STAGE3_W_REG", 2e-4)
+
+    post_nl = DifferentiableMemoryPolynomial(memory_depth=taps, nonlinear_order=order).to(device)
+    opt = optim.Adam(post_nl.parameters(), lr=float(lr), betas=(0.5, 0.9))
+    fs = float(sim.fs)
+    t = torch.arange(N, device=device, dtype=torch.float32) / fs
+    k_min = max(int(np.ceil(fmin * N / fs)), 8)
+    k_max = min(int(np.floor(fmax * N / fs)), N // 2 - 8)
+
+    print(f">> Post-NL: taps={taps} order={order} steps={steps} lr={lr:g} batch={batch} N={N}")
+    for step in range(int(steps)):
+        loss_acc = 0.0
+        for _ in range(int(batch)):
+            k = int(np.random.randint(k_min, k_max + 1))
+            fin = float(k) * fs / float(N)
+            amp = float(np.random.uniform(0.4, 0.95))
+            src = torch.sin(2.0 * np.pi * fin * t) * amp
+            src_np = src.detach().cpu().numpy().astype(np.float64)
+
+            y0 = sim.apply_channel_effect(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch0)
+            y1 = sim.apply_channel_effect(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch1)
+            yr = sim.apply_channel_effect(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ref)
+
+            s12 = max(float(np.max(np.abs(y0))), 1e-12)
+            with torch.no_grad():
+                x1 = torch.FloatTensor(y1 / s12).view(1, 1, -1).to(device)
+                y1c = model(x1).detach().cpu().numpy().flatten() * s12
+
+            tiadc_in = interleave_fullrate(y0, y1c)
+            target = yr[: len(tiadc_in)]
+            s0 = max(float(np.max(np.abs(tiadc_in))), float(np.max(np.abs(target))), 1e-12)
+            x = torch.FloatTensor(tiadc_in / s0).view(1, 1, -1).to(device)
+            y = torch.FloatTensor(target / s0).view(1, 1, -1).to(device)
+            x = torch.clamp(x, -1.0, 1.0)
+            y = torch.clamp(y, -1.0, 1.0)
+
+            if model.post_qe is not None:
+                with torch.no_grad():
+                    x = model.post_qe(x)
+
+            y_hat = post_nl(x)
+            loss_h = residual_harmonic_loss_torch(y_hat - y, y, int(k), guard=guard)
+            win = torch.hann_window(N, device=device, dtype=x.dtype).view(1, 1, -1)
+            Yh = torch.fft.rfft(y_hat * win, dim=-1, norm="ortho")
+            Yr = torch.fft.rfft(y * win, dim=-1, norm="ortho")
+            loss_f = torch.mean((torch.log10(torch.abs(Yh[..., int(k)]) + 1e-12) - torch.log10(torch.abs(Yr[..., int(k)]) + 1e-12)) ** 2)
+            loss_d = torch.mean((y_hat - x) ** 2)
+            loss_t = torch.mean((y_hat - y) ** 2)
+            reg = sum(torch.mean(p**2) for p in post_nl.parameters())
+
+            loss = w_time * loss_t + w_harm * loss_h + w_fund * loss_f + w_delta * loss_d + w_reg * reg
+            loss_acc = loss_acc + loss
+
+        loss_acc = loss_acc / float(max(int(batch), 1))
+        opt.zero_grad()
+        loss_acc.backward()
+        torch.nn.utils.clip_grad_norm_(post_nl.parameters(), max_norm=1.0)
+        opt.step()
+        if step % 150 == 0:
+            w_mean = float(torch.mean(torch.stack([p.abs().mean() for p in post_nl.parameters()])).detach().cpu())
+            print(f"Post-NL step {step:4d}/{steps} | loss={loss_acc.item():.3e} | w_mean~{w_mean:.2e}")
+
+    return post_nl
+
+
+def train_all(sim: TIADCSimulator, *, device: str):
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    params_ch0 = {"cutoff_freq": 8.0e9, "delay_samples": 0.0, "gain": 1.0, "hd2": 1e-3, "hd3": 0.5e-3}
+    params_ch1 = {"cutoff_freq": 7.8e9, "delay_samples": 0.25, "gain": 0.98, "hd2": 5e-3, "hd3": 3e-3}
+    params_ref = {"cutoff_freq": params_ch0["cutoff_freq"], "delay_samples": 0.0, "gain": 1.0, "hd2": 0.0, "hd3": 0.0, "snr_target": None}
+
+    N_train = 32768
+    M_average = 16
+    white = np.random.randn(N_train)
+    b, a = signal.butter(6, 7.0e9 / (sim.fs / 2), btype="low")
+    base_sig = signal.lfilter(b, a, white)
+    base_sig = base_sig / np.max(np.abs(base_sig)) * 0.9
+
+    ch0_caps, ch1_caps = [], []
+    for _ in range(M_average):
+        ch0_caps.append(sim.apply_channel_effect(base_sig, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch0))
+        ch1_caps.append(sim.apply_channel_effect(base_sig, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch1))
+    avg_ch0 = np.mean(np.stack(ch0_caps), axis=0)
+    avg_ch1 = np.mean(np.stack(ch1_caps), axis=0)
+
+    scale = max(float(np.max(np.abs(avg_ch0))), 1e-12)
+    inp = torch.FloatTensor(avg_ch1 / scale).view(1, 1, -1).to(device)
+    tgt = torch.FloatTensor(avg_ch0 / scale).view(1, 1, -1).to(device)
+
+    model = HybridCalibrationModel(taps=63).to(device)
+    loss_fn = ComplexMSELoss()
+
+    print("=== Stage 1: Relative Delay & Gain ===")
+    opt1 = optim.Adam(
+        [
+            {"params": model.global_delay.parameters(), "lr": 1e-2},
+            {"params": model.gain, "lr": 1e-2},
+            {"params": model.conv.parameters(), "lr": 0.0},
+        ]
+    )
+    for _ in range(301):
+        opt1.zero_grad()
+        loss = loss_fn(model(inp), tgt, model)
+        loss.backward()
+        opt1.step()
+
+    print("=== Stage 2: Relative FIR ===")
+    opt2 = optim.Adam(
+        [
+            {"params": model.global_delay.parameters(), "lr": 0.0},
+            {"params": model.gain, "lr": 0.0},
+            {"params": model.conv.parameters(), "lr": 5e-4},
+        ],
+        betas=(0.5, 0.9),
+    )
+    for _ in range(1001):
+        opt2.zero_grad()
+        loss = loss_fn(model(inp), tgt, model)
+        loss.backward()
+        opt2.step()
+
+    if _env_bool("ENABLE_POST_QE", True):
+        model.post_qe = train_post_qe(sim=sim, model=model, params_ch0=params_ch0, params_ch1=params_ch1, params_ref=params_ref, scale_ref=scale, device=device)
+    else:
+        model.post_qe = None
+
+    if _env_bool("ENABLE_STAGE3_NONLINEAR", True):
+        model.post_nl = train_post_nl(sim=sim, model=model, params_ch0=params_ch0, params_ch1=params_ch1, params_ref=params_ref, scale_ref=scale, device=device)
+    else:
+        model.post_nl = None
+
+    model.reference_params = params_ref
+    return model, scale, params_ch0, params_ch1
+
+
+# ==============================================================================
+# Metrics
+# ==============================================================================
+def calc_spectrum_metrics(sig: np.ndarray, fs: float, fin: float):
+    sig = np.asarray(sig, dtype=np.float64)
+    n = len(sig)
+    win = np.blackman(n)
+    cg = float(np.mean(win))
+    S = np.fft.rfft(sig * win)
+    mag = np.abs(S) / (n / 2 * cg + 1e-20)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
+    idx = int(np.argmin(np.abs(freqs - fin)))
+    span = 5
+    s0 = max(0, idx - span)
+    e0 = min(len(mag), idx + span + 1)
+    idxp = s0 + int(np.argmax(mag[s0:e0]))
+    p_fund = float(mag[idxp] ** 2) + 1e-30
+
+    mask = np.ones_like(mag, dtype=bool)
+    mask[:5] = False
+    mask[max(0, idxp - span) : min(len(mask), idxp + span + 1)] = False
+    p_nd = float(np.sum(mag[mask] ** 2)) + 1e-30
+    sinad = 10.0 * np.log10(p_fund / p_nd)
+    enob = (sinad - 1.76) / 6.02
+    p_spur = float(np.max(mag[mask] ** 2)) if np.any(mask) else 1e-30
+    sfdr = 10.0 * np.log10(p_fund / (p_spur + 1e-30))
+
+    p_h = 0.0
+    for h in range(2, 6):
+        hf = (fin * h) % fs
+        if hf > fs / 2:
+            hf = fs - hf
+        if hf < 1e6 or hf > fs / 2 - 1e6:
+            continue
+        k = int(np.argmin(np.abs(freqs - hf)))
+        ss = max(0, k - span)
+        ee = min(len(mag), k + span + 1)
+        kk = ss + int(np.argmax(mag[ss:ee]))
+        p_h += float(mag[kk] ** 2)
+    thd = 10.0 * np.log10((p_h + 1e-30) / p_fund)
+    return float(sinad), float(enob), float(thd), float(sfdr)
+
+
+def evaluate(sim: TIADCSimulator, model: HybridCalibrationModel, scale: float, device: str, p_ch0: dict, p_ch1: dict):
+    test_freqs = np.arange(0.1e9, 6.6e9, 0.2e9)
+    m = {k: [] for k in ["sinad_pre", "sinad_post", "sinad_post_qe", "sinad_post_nl",
+                         "enob_pre", "enob_post", "enob_post_qe", "enob_post_nl",
+                         "thd_pre", "thd_post", "thd_post_qe", "thd_post_nl",
+                         "sfdr_pre", "sfdr_post", "sfdr_post_qe", "sfdr_post_nl"]}
+
+    for f in test_freqs:
+        src = sim.generate_tone_data(float(f), N=8192 * 2) * 0.9
+        y0 = sim.apply_channel_effect(src, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p_ch0)
+        y1 = sim.apply_channel_effect(src, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **p_ch1)
+
+        with torch.no_grad():
+            x1 = torch.FloatTensor(y1 / float(scale)).view(1, 1, -1).to(device)
+            y1c = model(x1).cpu().numpy().flatten() * float(scale)
+
+        margin = 500
+        c0 = y0[margin:-margin]
+        c1r = y1[margin:-margin]
+        c1c = y1c[margin:-margin]
+
+        pre = interleave_fullrate(c0, c1r)
+        post = interleave_fullrate(c0, c1c)
+
+        post_qe = post
+        if model.post_qe is not None:
+            s = max(float(np.max(np.abs(post))), 1e-12)
+            with torch.no_grad():
+                x = torch.FloatTensor(post / s).view(1, 1, -1).to(device)
+                y = model.post_qe(x).cpu().numpy().flatten() * s
+            post_qe = y
+
+        post_nl = post_qe
+        if model.post_nl is not None:
+            s = max(float(np.max(np.abs(post_qe))), 1e-12)
+            with torch.no_grad():
+                x = torch.FloatTensor(post_qe / s).view(1, 1, -1).to(device)
+                y = model.post_nl(x).cpu().numpy().flatten() * s
+            post_nl = y
+
+        s0, e0, t0, sf0 = calc_spectrum_metrics(pre, sim.fs, float(f))
+        s1, e1, t1, sf1 = calc_spectrum_metrics(post, sim.fs, float(f))
+        s2, e2, t2, sf2 = calc_spectrum_metrics(post_qe, sim.fs, float(f))
+        s3, e3, t3, sf3 = calc_spectrum_metrics(post_nl, sim.fs, float(f))
+
+        m["sinad_pre"].append(s0); m["sinad_post"].append(s1); m["sinad_post_qe"].append(s2); m["sinad_post_nl"].append(s3)
+        m["enob_pre"].append(e0); m["enob_post"].append(e1); m["enob_post_qe"].append(e2); m["enob_post_nl"].append(e3)
+        m["thd_pre"].append(t0); m["thd_post"].append(t1); m["thd_post_qe"].append(t2); m["thd_post_nl"].append(t3)
+        m["sfdr_pre"].append(sf0); m["sfdr_post"].append(sf1); m["sfdr_post_qe"].append(sf2); m["sfdr_post_nl"].append(sf3)
+
+    return test_freqs, m
+
+
+def plot_metrics(freqs: np.ndarray, m: dict):
+    fghz = freqs / 1e9
+    plt.figure(figsize=(10, 13))
+
+    plt.subplot(4, 1, 1)
+    plt.plot(fghz, m["sinad_pre"], "r--o", alpha=0.5, label="Pre-Calib")
+    plt.plot(fghz, m["sinad_post"], "g-o", linewidth=2, label="Post-Linear")
+    plt.plot(fghz, m["sinad_post_qe"], color="#ff7f0e", marker="o", linewidth=2, label="Post-QE")
+    plt.plot(fghz, m["sinad_post_nl"], "b--o", alpha=0.85, label="Post-NL")
+    plt.title("SINAD Improvement"); plt.ylabel("dB"); plt.legend(); plt.grid(True)
+
+    plt.subplot(4, 1, 2)
+    plt.plot(fghz, m["enob_pre"], "r--o", alpha=0.5, label="Pre-Calib")
+    plt.plot(fghz, m["enob_post"], "m-o", linewidth=2, label="Post-Linear")
+    plt.plot(fghz, m["enob_post_qe"], color="#ff7f0e", marker="o", linewidth=2, label="Post-QE")
+    plt.plot(fghz, m["enob_post_nl"], "b--o", alpha=0.85, label="Post-NL")
+    plt.title("ENOB Improvement"); plt.ylabel("Bits"); plt.legend(); plt.grid(True)
+
+    plt.subplot(4, 1, 3)
+    plt.plot(fghz, m["thd_pre"], "r--o", alpha=0.5, label="Pre-Calib")
+    plt.plot(fghz, m["thd_post"], "b-o", linewidth=2, label="Post-Linear")
+    plt.plot(fghz, m["thd_post_qe"], color="#ff7f0e", marker="o", linewidth=2, label="Post-QE")
+    plt.plot(fghz, m["thd_post_nl"], "k--o", alpha=0.85, label="Post-NL")
+    plt.title("THD Comparison"); plt.ylabel("dBc"); plt.legend(); plt.grid(True)
+
+    plt.subplot(4, 1, 4)
+    plt.plot(fghz, m["sfdr_pre"], "r--o", alpha=0.5, label="Pre-Calib")
+    plt.plot(fghz, m["sfdr_post"], "c-o", linewidth=2, label="Post-Linear")
+    plt.plot(fghz, m["sfdr_post_qe"], color="#ff7f0e", marker="o", linewidth=2, label="Post-QE")
+    plt.plot(fghz, m["sfdr_post_nl"], "b--o", alpha=0.85, label="Post-NL")
+    plt.title("SFDR Improvement"); plt.xlabel("Frequency (GHz)"); plt.ylabel("dBc"); plt.legend(); plt.grid(True)
+
+    plt.tight_layout()
+    save_current_figure("metrics_vs_freq")
+
+
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("\n=== 运行配置摘要（SLIM）===")
+    print(f"device={device} | ENABLE_POST_QE={_env_bool('ENABLE_POST_QE', True)} | ENABLE_STAGE3_NONLINEAR={_env_bool('ENABLE_STAGE3_NONLINEAR', True)}")
+
+    sim = TIADCSimulator(fs=20e9)
+    model, scale, p0, p1 = train_all(sim, device=device)
+    freqs, m = evaluate(sim, model, scale, device, p0, p1)
+
+    print("\n=== 关键频点（Pre -> Post-Linear -> Post-QE -> Post-NL）===")
+    pick = [0.1, 1.5, 3.0, 4.5, 5.5, 6.0, 6.5]
+    for g in pick:
+        i = int(np.argmin(np.abs(freqs - g * 1e9)))
+        print(
+            f"f={freqs[i]/1e9:>4.1f}GHz | "
+            f"SINAD {m['sinad_pre'][i]:>6.2f}->{m['sinad_post'][i]:>6.2f}->{m['sinad_post_qe'][i]:>6.2f}->{m['sinad_post_nl'][i]:>6.2f} dB | "
+            f"THD {m['thd_pre'][i]:>7.2f}->{m['thd_post'][i]:>7.2f}->{m['thd_post_qe'][i]:>7.2f}->{m['thd_post_nl'][i]:>7.2f} dBc | "
+            f"SFDR {m['sfdr_pre'][i]:>6.2f}->{m['sfdr_post'][i]:>6.2f}->{m['sfdr_post_qe'][i]:>6.2f}->{m['sfdr_post_nl'][i]:>6.2f} dBc"
+        )
+
+    plot_metrics(freqs, m)
+# *** End of File
 import re
 import sys
 from datetime import datetime
@@ -1335,7 +2754,7 @@ def select_best_alpha_post_nl(
     return best_alpha, best_summary
 
 
-if __name__ == "__main__":
+if False and __name__ == "__main__":  # legacy入口：已停用（仅保留文件历史，不参与运行）
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -1982,7 +3401,7 @@ def plot_metrics(test_freqs: np.ndarray, m: dict) -> None:
     save_current_figure("metrics_vs_freq")
 
 
-if __name__ == "__main__":
+if False and __name__ == "__main__":  # legacy入口：已停用（仅保留文件历史，不参与运行）
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -2763,7 +4182,7 @@ def plot_metrics(test_freqs: np.ndarray, m: dict) -> None:
 # ==============================================================================
 # Main
 # ==============================================================================
-if __name__ == "__main__":
+if False and __name__ == "__main__":  # legacy入口：已停用（仅保留文件历史，不参与运行）
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -3183,122 +4602,139 @@ def build_and_attach_post_eq(
     else:
         print("\n=== Post-EQ: Interleaved output -> Unit-Impulse (Identity) ===")
 
-    # 1) 构造“干净”的交织输入
-    y0_clean = simulator.apply_channel_effect(base_sig, jitter_std=0, n_bits=None, **params_ch0)
-    y1_clean = simulator.apply_channel_effect(base_sig, jitter_std=0, n_bits=None, **params_ch1)
-    with torch.no_grad():
-        x1 = torch.FloatTensor(y1_clean / scale).view(1, 1, -1).to(device)
-        y1_cal = model(x1).cpu().numpy().flatten() * scale
+    # 1) Post-QE（物理信息静态逆，多项式）训练口径修正：
+    # - 必须与 Stage3/验证一致：使用“真实 ADC 条件”（噪声+量化），并用相干单音集合训练
+    # - 目标必须是“同口径 reference”（同噪声/量化），避免学到“去噪/反量化”的坏解
+    params_ref = {
+        "cutoff_freq": float(params_ch0["cutoff_freq"]),
+        "delay_samples": 0.0,
+        "gain": 1.0,
+        "hd2": 0.0,
+        "hd3": 0.0,
+        "snr_target": None,
+    }
+    # 让指标绘图里也能看到 reference baseline（与 Stage3 复用）
+    model.reference_params = params_ref
 
-    y_tiadc = tiadc_interleave_from_fullrate(y0_clean, y1_cal)
-
-    # 2) 构造 target
-    # - 恒等口径：x_target = base_sig(带宽内)；更像“单位冲激/恒等系统校准”
-    # - 参考口径：x_target = reference instrument capture；更像“有参考的 foreground calibration”
-    if use_reference_target:
-        params_ref = {
-            "cutoff_freq": float(params_ch0["cutoff_freq"]),
-            "delay_samples": 0.0,
-            "gain": 1.0,
-            "hd2": 0.0,
-            "hd3": 0.0,
-            # 训练目标与输入必须同等噪声口径；不让 Post‑EQ 学“去噪/反量化”
-            "snr_target": None,
-        }
-        y_ref_clean = simulator.apply_channel_effect(base_sig, jitter_std=0, n_bits=None, **params_ref)
-        x_target = y_ref_clean[: len(y_tiadc)].astype(np.float64, copy=False)
-
-        # 让指标绘图里也能看到 reference baseline（与 Stage3 的 reference_params 复用同一字段）
-        model.reference_params = params_ref
-    else:
-        b, a = signal.butter(6, float(band_hz) / (simulator.fs / 2), btype="low")
-        x_ideal = signal.lfilter(b, a, base_sig.astype(np.float64))
-        x_ideal = np.clip(x_ideal, -1.0, 1.0)
-        x_target = x_ideal[: len(y_tiadc)]
-
-    # 3) 设计 FIR 并挂载
-    taps = int(taps)
-    if taps % 2 == 0:
-        taps += 1
-    mode = str(mode).strip().lower()
-    if mode not in ("lti", "ptv2", "ptv2_ddsp"):
-        raise ValueError(f"POST_EQ_MODE must be 'lti' / 'ptv2' / 'ptv2_ddsp', got {mode!r}")
+    # 2) 用“物理信息静态逆模型层”替代 Post‑EQ（命名为 Post‑QE）
+    #
+    # 说明：
+    # - 原 Post‑EQ 是“交织后线性 FIR 反卷积/均衡”，属于黑盒/信号处理求解。
+    # - 这里改成显式的多项式逆模型层，只学习少量具有物理意义的系数（w1/w2/w3...）。
+    # - 该层默认 PTV（even/odd 两套系数），更符合 TIADC 子通道差异来源。
 
     # 清理旧字段，避免口径混淆
     model.post_fir = None
     model.post_fir_even = None
     model.post_fir_odd = None
+    model.post_fir_meta = None
 
-    if mode == "lti":
-        g = design_post_eq_fir_wiener(
-            y=y_tiadc,
-            x_target=x_target,
-            fs_hz=simulator.fs,
-            taps=taps,
-            band_hz=band_hz,
-            hf_weight=hf_weight,
-            ridge=ridge,
-        )
-        attach_post_eq_fir(model, g=g, device=device)
-        print(f">> Post-EQ(LTI) ready: taps={taps}, band={band_hz/1e9:.2f}GHz, ridge={ridge:g}, hf_w={hf_weight:g}")
-    elif mode == "ptv2":
-        g_even, g_odd = design_post_eq_fir_ptv2_ridge(
-            y=y_tiadc,
-            x_target=x_target,
-            fs_hz=float(simulator.fs),
-            band_hz=float(band_hz),
-            taps=taps,
-            ridge=ridge,
-            diff_reg=float(POST_EQ_PTV2_DIFF),
-            crop=300,
-        )
-        attach_post_eq_fir_ptv2(model, g_even=g_even, g_odd=g_odd, device=device)
-        print(f">> Post-EQ(PTV2) ready: taps={taps}, ridge={ridge:g}, diff={float(POST_EQ_PTV2_DIFF):g} (even/odd)")
-    else:
-        if not use_reference_target:
-            print(">> 警告：PTV2-DDSP 推荐 use_reference_target=True（否则目标不一致，易出现“看似收敛但指标不稳”）")
-        post_even, post_odd = train_post_eq_ptv2_ddsp(
-            simulator=simulator,
-            model_stage12=model,
-            base_sig=base_sig,
-            scale=float(scale),
-            params_ch0=params_ch0,
-            params_ch1=params_ch1,
-            params_ref=getattr(model, "reference_params", None) or {
-                "cutoff_freq": float(params_ch0["cutoff_freq"]),
-                "delay_samples": 0.0,
-                "gain": 1.0,
-                "hd2": 0.0,
-                "hd3": 0.0,
-                # 训练目标与输入必须同等噪声口径；不让 Post‑EQ 学“去噪/反量化”
-                "snr_target": None,
-            },
-            device=device,
-            taps=taps,
-            band_hz=float(band_hz),
-            hf_weight=float(hf_weight),
-            ridge=float(ridge),
-            diff_reg=float(POST_EQ_PTV2_DIFF),
-            steps=int(POST_EQ_TRAIN_STEPS),
-            lr=float(POST_EQ_TRAIN_LR),
-            w_time=float(POST_EQ_W_TIME),
-            w_freq=float(POST_EQ_W_FREQ),
-            w_delta=float(POST_EQ_W_DELTA),
-            w_smooth=float(POST_EQ_W_SMOOTH),
-        )
-        model.post_fir_even = post_even
-        model.post_fir_odd = post_odd
-        print(f">> Post-EQ(PTV2-DDSP) ready: taps={taps}, steps={int(POST_EQ_TRAIN_STEPS)}, lr={float(POST_EQ_TRAIN_LR):g}")
+    # 训练配置（默认更保守；可用环境变量覆盖）
+    qe_order = _env_int("POST_QE_ORDER", 3)
+    qe_steps = _env_int("POST_QE_STEPS", 450)
+    qe_lr = _env_float("POST_QE_LR", 5e-4)
+    qe_batch = _env_int("POST_QE_BATCH", 6)
+    qe_tone_n = _env_int("POST_QE_TONE_N", 8192)
+    qe_fmin_hz = _env_float("POST_QE_FMIN_HZ", 0.2e9)
+    qe_fmax_hz = _env_float("POST_QE_FMAX_HZ", 6.2e9)
+    qe_guard = _env_int("POST_QE_GUARD", 3)
+    qe_w_time = _env_float("POST_QE_W_TIME", 10.0)
+    qe_w_harm = _env_float("POST_QE_W_HARM", 450.0)
+    qe_w_fund = _env_float("POST_QE_W_FUND", 8.0)
+    qe_w_delta = _env_float("POST_QE_W_DELTA", 25.0)
+    qe_ridge = _env_float("POST_QE_RIDGE", 2e-4)
 
-    model.post_fir_meta = {
-        "mode": mode,
-        "taps": int(taps),
-        "band_hz": float(band_hz),
-        "hf_weight": float(hf_weight),
-        "ridge": float(ridge),
+    post_qe = PhysicalNonlinearityLayer(order=int(qe_order), ptv=True).to(device)
+    opt = optim.Adam(post_qe.parameters(), lr=float(qe_lr), betas=(0.5, 0.9))
+
+    fs = float(simulator.fs)
+    N = int(qe_tone_n)
+    t = torch.arange(N, device=device, dtype=torch.float32) / float(fs)
+    k_min = max(int(np.ceil(float(qe_fmin_hz) * N / fs)), 8)
+    k_max = min(int(np.floor(float(qe_fmax_hz) * N / fs)), N // 2 - 8)
+
+    print(f">> Post-QE(Physics-Poly) training: order={qe_order} steps={qe_steps} lr={qe_lr:g} batch={qe_batch} N={qe_tone_n} guard={qe_guard}")
+    for step in range(int(qe_steps)):
+        loss_acc = 0.0
+        for _ in range(int(qe_batch)):
+            k = int(np.random.randint(k_min, k_max + 1))
+            fin = float(k) * fs / float(N)
+            amp = float(np.random.uniform(0.4, 0.95))
+            src = torch.sin(2.0 * np.pi * fin * t) * amp
+            src_np = src.detach().cpu().numpy().astype(np.float64)
+
+            # 真实口径：噪声+量化（与验证一致）
+            y0 = simulator.apply_channel_effect(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch0)
+            y1 = simulator.apply_channel_effect(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch1)
+            yr = simulator.apply_channel_effect(src_np, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ref)
+
+            with torch.no_grad():
+                x1 = torch.FloatTensor(y1 / scale).view(1, 1, -1).to(device)
+                y1_lin = model(x1).cpu().numpy().flatten() * scale
+
+            tiadc_in = tiadc_interleave_from_fullrate(y0, y1_lin)
+            target = yr[: len(tiadc_in)] if bool(use_reference_target) else tiadc_interleave_from_fullrate(y0, y0)[: len(tiadc_in)]
+
+            s0 = max(float(np.max(np.abs(tiadc_in))), float(np.max(np.abs(target))), 1e-12)
+            x_in = torch.FloatTensor((tiadc_in / s0)).view(1, 1, -1).to(device)
+            y_tgt = torch.FloatTensor((target / s0)).view(1, 1, -1).to(device)
+            x_in = torch.clamp(x_in, -1.0, 1.0)
+            y_tgt = torch.clamp(y_tgt, -1.0, 1.0)
+
+            y_hat = post_qe(x_in)
+
+            # 以“残差谐波”为主目标，避免为了压谐波去扭曲基波/全带
+            residual = y_hat - y_tgt
+            loss_harm = residual_harmonic_loss_torch(residual, y_tgt, int(k), max_h=5, guard=int(qe_guard))
+
+            # 基波保护
+            win = torch.hann_window(N, device=device, dtype=x_in.dtype).view(1, 1, -1)
+            Yh = torch.fft.rfft(y_hat * win, dim=-1, norm="ortho")
+            Yr = torch.fft.rfft(y_tgt * win, dim=-1, norm="ortho")
+            fund_mag_hat = torch.abs(Yh[..., int(k)]) + 1e-12
+            fund_mag_ref = torch.abs(Yr[..., int(k)]) + 1e-12
+            loss_fund = torch.mean((torch.log10(fund_mag_hat) - torch.log10(fund_mag_ref)) ** 2)
+
+            # 最小改动 + 小权重时域贴合
+            loss_delta = torch.mean((y_hat - x_in) ** 2)
+            loss_time = torch.mean((y_hat - y_tgt) ** 2)
+
+            # 正则（raw 参数 L2，越保守越不易出坏解）
+            reg = 0.0
+            for p in post_qe.parameters():
+                reg = reg + torch.mean(p ** 2)
+
+            loss = (
+                float(qe_w_time) * loss_time
+                + float(qe_w_harm) * loss_harm
+                + float(qe_w_fund) * loss_fund
+                + float(qe_w_delta) * loss_delta
+                + float(qe_ridge) * reg
+            )
+            loss_acc = loss_acc + loss
+
+        loss_acc = loss_acc / float(max(int(qe_batch), 1))
+        opt.zero_grad()
+        loss_acc.backward()
+        torch.nn.utils.clip_grad_norm_(post_qe.parameters(), max_norm=1.0)
+        opt.step()
+
+        if step % 150 == 0:
+            print(f"Post-QE(Physics-Poly) step {step:4d}/{int(qe_steps)} | loss={loss_acc.item():.3e}")
+
+    # 挂载到模型上，供验证/绘图使用
+    model.post_qe = post_qe
+    model.post_qe_meta = {
+        "type": "physics_poly_inverse",
+        "order": int(qe_order),
+        "steps": int(qe_steps),
+        "lr": float(qe_lr),
+        "batch": int(qe_batch),
+        "tone_n": int(qe_tone_n),
+        "ridge": float(qe_ridge),
         "use_reference_target": bool(use_reference_target),
-        "reference_snr_db": float(reference_snr_db),
     }
+    print(">> Post-QE(Physics-Poly) ready.")
 
 # Windows 控制台常见编码问题（不影响算法，只为避免乱码）
 try:
@@ -3329,9 +4765,9 @@ STAGE3_REFERENCE_SNR_DB = 120.0
 #
 # [新增] 更稳的求解方式：在 *_ls 模式下，用岭回归一次性解出最优参数（避免 Adam 训练把指标拉坏）
 # - ptv_poly_ls / ptv_volterra_ls: 推荐优先试（通常更稳、更不容易引入新 spur）
-STAGE3_SCHEME = "odd_volterra_ls"  # 推荐：odd_poly_ls/odd_volterra_ls（更稳）；也可用 ptv_* 系列
+STAGE3_SCHEME = "pinn_mem_poly"  # 物理信息版：PTV 记忆多项式（可微分 + 少量可解释参数）
 STAGE3_SWEEP = False            # True 时：自动对比多种 scheme，选最优挂载
-STAGE3_SWEEP_SCHEMES = ("odd_poly_ls", "odd_volterra_ls", "ptv_poly_ls", "ptv_volterra_ls", "ptv_poly", "ptv_volterra")
+STAGE3_SWEEP_SCHEMES = ("pinn_mem_poly", "odd_poly_ls", "odd_volterra_ls", "ptv_poly_ls", "ptv_volterra_ls", "ptv_poly", "ptv_volterra")
 STAGE3_SWEEP_STEPS = 350        # sweep 时每个 scheme 的训练步数（快速找方向）
 
 # [新增] 自动搜索：在多个“目标定义 + 模型结构 + taps + 岭回归强度”上自动挑最优（推荐开启后跑一次）
@@ -3676,6 +5112,153 @@ class OddOnlyMemorylessPoly23(nn.Module):
         mask_even[:, :, 0::2] = 1.0
         mask_odd = 1.0 - mask_even
         return x + corr * mask_odd
+
+
+class PhysicalNonlinearityLayer(nn.Module):
+    """
+    物理信息静态逆模型层（memoryless polynomial inverse）：
+      y = w1*x + w2*x^2 + w3*x^3 (+ ...)
+
+    - 默认使用 PTV（even/odd 两套系数），更贴近 TIADC 子通道非线性差异
+    - 初始化为“近似线性”：w1=1，其它=0
+    """
+
+    def __init__(self, *, order: int = 3, ptv: bool = True):
+        super().__init__()
+        self.order = int(order)
+        if self.order < 1:
+            raise ValueError("order must be >= 1")
+        self.ptv = bool(ptv)
+        # 设计目标：
+        # - 不破坏 Stage1/2 的线性解：线性项固定为 1，只学习非线性残差（p>=2）
+        # - 系数必须限幅（tanh），避免出现“把信号打爆”的坏解
+        # - 使用 residual/alpha 小步修正：y = x + alpha * f_nl(x)
+        self.alpha = float(os.getenv("POST_QE_ALPHA", "0.25"))
+
+        # p=2..order 的系数上限（经验值：与 hd2/hd3 同量级，默认 1e-2 以内）
+        # 对应项：x^2, x^3, x^4...
+        max_p2 = float(os.getenv("POST_QE_MAX_P2", "8e-3"))
+        max_p3 = float(os.getenv("POST_QE_MAX_P3", "6e-3"))
+        max_hi = float(os.getenv("POST_QE_MAX_PHI", "2e-3"))
+        scales = []
+        for p in range(2, self.order + 1):
+            if p == 2:
+                scales.append(max_p2)
+            elif p == 3:
+                scales.append(max_p3)
+            else:
+                scales.append(max_hi)
+        self.register_buffer("_scales", torch.tensor(scales, dtype=torch.float32))  # (order-1,)
+
+        if self.ptv:
+            self.raw_even = nn.Parameter(torch.zeros(self.order - 1, dtype=torch.float32))
+            self.raw_odd = nn.Parameter(torch.zeros(self.order - 1, dtype=torch.float32))
+        else:
+            self.raw = nn.Parameter(torch.zeros(self.order - 1, dtype=torch.float32))
+
+    def _nl_residual(self, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+        # f_nl(x) = sum_{p=2..order} a_p * x^p
+        a = self._scales.to(device=x.device, dtype=x.dtype) * torch.tanh(raw.to(device=x.device, dtype=x.dtype))
+        y = torch.zeros_like(x)
+        for i, p in enumerate(range(2, self.order + 1)):
+            y = y + a[i] * (x ** p)
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, -1.0, 1.0)
+        alpha = float(self.alpha)
+        if not self.ptv:
+            return x + alpha * self._nl_residual(x, self.raw)
+
+        xe = x[..., 0::2]
+        xo = x[..., 1::2]
+        re = self._nl_residual(xe, self.raw_even)
+        ro = self._nl_residual(xo, self.raw_odd)
+        y = x.clone()
+        y[..., 0::2] = xe + alpha * re
+        y[..., 1::2] = xo + alpha * ro
+        return y
+
+
+class DifferentiableMemoryPolynomial(nn.Module):
+    """
+    可微分记忆多项式（Memory Polynomial, MP）：
+      y[n] = sum_{k=0..K-1} sum_{p=1..P} c[k,p] * x[n-k]^p
+
+    - 默认使用 PTV（even/odd 两套 c[k,p]），等价于“每个子 ADC 的 MP 逆模型”
+    - 初始化为恒等：c[0,1]=1，其它=0
+    """
+
+    def __init__(self, *, memory_depth: int = 3, nonlinear_order: int = 3, ptv: bool = True):
+        super().__init__()
+        self.K = int(memory_depth)
+        self.P = int(nonlinear_order)
+        if self.K < 1 or self.P < 1:
+            raise ValueError("memory_depth and nonlinear_order must be >= 1")
+        self.ptv = bool(ptv)
+        # 关键：避免破坏线性校准（Stage1/2）
+        # - 线性项固定：仅 x[n] 的系数为 1，其余线性 taps = 0
+        # - 只学习 p>=2 的非线性项，并做限幅 + residual/alpha
+        self.alpha = float(os.getenv("POST_NL_ALPHA", "0.25"))
+
+        if self.P < 2:
+            raise ValueError("nonlinear_order must be >= 2 for post-nonlinear stage")
+
+        # p=2..P 的系数上限（与 hd2/hd3 同量级），高阶更小
+        max_p2 = float(os.getenv("POST_NL_MAX_P2", "8e-3"))
+        max_p3 = float(os.getenv("POST_NL_MAX_P3", "6e-3"))
+        max_hi = float(os.getenv("POST_NL_MAX_PHI", "2e-3"))
+        scales = []
+        for p in range(2, self.P + 1):
+            if p == 2:
+                scales.append(max_p2)
+            elif p == 3:
+                scales.append(max_p3)
+            else:
+                scales.append(max_hi)
+        self.register_buffer("_scales", torch.tensor(scales, dtype=torch.float32))  # (P-1,)
+
+        # raw coeffs: (K, P-1) 对应 p=2..P
+        if self.ptv:
+            self.raw_even = nn.Parameter(torch.zeros(self.K, self.P - 1, dtype=torch.float32))
+            self.raw_odd = nn.Parameter(torch.zeros(self.K, self.P - 1, dtype=torch.float32))
+        else:
+            self.raw = nn.Parameter(torch.zeros(self.K, self.P - 1, dtype=torch.float32))
+
+    @staticmethod
+    def _delay(x: torch.Tensor, k: int) -> torch.Tensor:
+        # 因果延迟：x[n-k]，左侧补 0
+        if k <= 0:
+            return x
+        xpad = F.pad(x, (k, 0), mode="constant", value=0.0)
+        return xpad[..., :-k]
+
+    def _mp_residual(self, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+        # f_nl(x) = sum_{k=0..K-1} sum_{p=2..P} c[k,p] * x[n-k]^p
+        x = torch.clamp(x, -1.0, 1.0)
+        scales = self._scales.to(device=x.device, dtype=x.dtype)  # (P-1,)
+        raw_t = raw.to(device=x.device, dtype=x.dtype)
+        y = torch.zeros_like(x)
+        for k in range(self.K):
+            xd = self._delay(x, k)
+            a = scales * torch.tanh(raw_t[k, :])
+            for i, p in enumerate(range(2, self.P + 1)):
+                y = y + a[i] * (xd ** p)
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, -1.0, 1.0)
+        alpha = float(self.alpha)
+        if not self.ptv:
+            # 线性项恒等：y = x + alpha * f_nl(x)
+            return x + alpha * self._mp_residual(x, self.raw)
+
+        xe = x[..., 0::2]
+        xo = x[..., 1::2]
+        y = x.clone()
+        y[..., 0::2] = xe + alpha * self._mp_residual(xe, self.raw_even)
+        y[..., 1::2] = xo + alpha * self._mp_residual(xo, self.raw_odd)
+        return y
 
 
 def _fold_freq_to_nyquist(f_hz: float, fs_hz: float) -> float:
@@ -4201,12 +5784,12 @@ def train_relative_calibration(simulator, device='cpu'):
         out[1::2] = s1[:L]
         return out
 
-    def _apply_stage3_post(sig_post_lin: np.ndarray) -> np.ndarray:
+    def _apply_stage3_post(sig_post_qe: np.ndarray) -> np.ndarray:
         if not (hasattr(model, "post_linearizer") and model.post_linearizer is not None):
-            return sig_post_lin
-        s = max(float(np.max(np.abs(sig_post_lin))), 1e-12)
+            return sig_post_qe
+        s = max(float(np.max(np.abs(sig_post_qe))), 1e-12)
         with torch.no_grad():
-            x = torch.FloatTensor(sig_post_lin / s).view(1, 1, -1).to(device)
+            x = torch.FloatTensor(sig_post_qe / s).view(1, 1, -1).to(device)
             y = model.post_linearizer(x).cpu().numpy().flatten() * s
         return y
 
@@ -4225,9 +5808,19 @@ def train_relative_calibration(simulator, device='cpu'):
                 y1c = model(x1).cpu().numpy().flatten() * scale
 
             sig_post_lin = _interleave_for_metric(y0, y1c)
-            sig_post_nl = _apply_stage3_post(sig_post_lin)
 
-            s1, _, t1, sf1 = _calc_spectrum_metrics_fast(sig_post_lin, simulator.fs, f)
+            # 新链路：Post-QE（如果存在）再接 Stage3(Post-NL)
+            sig_post_qe = sig_post_lin
+            if hasattr(model, "post_qe") and (model.post_qe is not None):
+                s_qe = max(float(np.max(np.abs(sig_post_lin))), 1e-12)
+                with torch.no_grad():
+                    xq = torch.FloatTensor(sig_post_lin / s_qe).view(1, 1, -1).to(device)
+                    yq = model.post_qe(xq).cpu().numpy().flatten() * s_qe
+                sig_post_qe = yq
+
+            sig_post_nl = _apply_stage3_post(sig_post_qe)
+
+            s1, _, t1, sf1 = _calc_spectrum_metrics_fast(sig_post_qe, simulator.fs, f)
             s2, _, t2, sf2 = _calc_spectrum_metrics_fast(sig_post_nl, simulator.fs, f)
             sin_lin.append(s1); sf_lin.append(sf1); th_lin.append(t1)
             sin_nl.append(s2); sf_nl.append(sf2); th_nl.append(t2)
@@ -4537,7 +6130,10 @@ def train_relative_calibration(simulator, device='cpu'):
         mid_bins = _bins_in_band(max(0.2e9, f0 - bw), min(fmax, f0 + bw))
         high_bins = _bins_in_band(3.5e9, 6.2e9)
 
-        if base == "ptv_volterra":
+        if base == "pinn_mem_poly":
+            # 物理信息版 Post-NL：PTV 记忆多项式（可微分 + 反向传播仅优化少量物理参数）
+            ddsp_model = DifferentiableMemoryPolynomial(memory_depth=int(STAGE3_TAPS), nonlinear_order=3, ptv=True).to(device)
+        elif base == "ptv_volterra":
             ddsp_model = DDSPVolterraNetwork(taps=STAGE3_TAPS).to(device)
         elif base == "ptv_poly":
             ddsp_model = PTVMemorylessPoly23().to(device)
@@ -4547,6 +6143,110 @@ def train_relative_calibration(simulator, device='cpu'):
             ddsp_model = OddOnlyMemorylessPoly23().to(device)
         else:
             raise ValueError(f"Unknown scheme={scheme!r} (base={base!r})")
+
+        # ----------------------------
+        # PINN/MP 训练分支（Adam）
+        # - 输入链路：Stage1/2 (线性) -> Post-QE(静态物理逆，多项式) -> Post-NL(记忆多项式)
+        # ----------------------------
+        if base == "pinn_mem_poly":
+            if solver != "adam":
+                raise ValueError("pinn_mem_poly 仅支持 Adam 训练（不支持 *_ls / *_harm_ls）")
+
+            opt3 = optim.Adam(ddsp_model.parameters(), lr=float(STAGE3_LR), betas=(0.5, 0.9))
+
+            # 训练：用相干采样单音，直接压谐波 + 基波保护 + 最小改动
+            for step in range(int(steps)):
+                loss_acc = 0.0
+                for _ in range(int(STAGE3_BATCH)):
+                    # 频点采样（带偏置）
+                    if np.random.rand() < float(STAGE3_BIAS_PROB):
+                        k = int(np.random.choice(mid_bins))
+                    else:
+                        r = np.random.rand()
+                        if r < 0.25:
+                            k = int(np.random.choice(low_bins))
+                        elif r < 0.70:
+                            k = int(np.random.choice(high_bins))
+                        else:
+                            k = int(np.random.choice(cand_bins))
+
+                    T = int(n)
+                    fin = float(k) * float(fs) / float(T)
+                    t = np.arange(T) / float(fs)
+                    amp = 0.7 + 0.2 * np.random.rand()
+                    src = np.sin(2 * np.pi * fin * t) * amp
+
+                    # 训练口径：真实 ADC 条件（噪声+量化）
+                    y0 = simulator.apply_channel_effect(src, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch0)
+                    y1 = simulator.apply_channel_effect(src, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ch1)
+
+                    with torch.no_grad():
+                        x1 = torch.FloatTensor(y1 / scale).view(1, 1, -1).to(device)
+                        y1_lin = model(x1).cpu().numpy().flatten() * scale
+
+                    tiadc_in = interleave_fullrate(y0, y1_lin)
+
+                    if STAGE3_USE_REFERENCE_TARGET:
+                        y_ref = simulator.apply_channel_effect(src, jitter_std=ADC_JITTER_STD, n_bits=ADC_NBITS, **params_ref)
+                        target = y_ref
+                    else:
+                        target = interleave_fullrate(y0, y0)
+
+                    s0 = max(float(np.max(np.abs(tiadc_in))), float(np.max(np.abs(target))), 1e-12)
+                    x = torch.FloatTensor((tiadc_in / s0)).view(1, 1, -1).to(device)
+                    y = torch.FloatTensor((target / s0)).view(1, 1, -1).to(device)
+                    x = torch.clamp(x, -1.0, 1.0)
+                    y = torch.clamp(y, -1.0, 1.0)
+
+                    # 先过 Post-QE（如果已训练/挂载）
+                    if hasattr(model, "post_qe") and (model.post_qe is not None):
+                        with torch.no_grad():
+                            x = model.post_qe(x)
+
+                    y_hat = ddsp_model(x)
+
+                    # loss: 残差谐波（更稳） + 基波保护 + 最小改动 + 小幅时域贴合
+                    residual = y_hat - y
+                    loss_harm = residual_harmonic_loss_torch(residual, y, int(k), max_h=5, guard=int(STAGE3_HARM_GUARD))
+
+                    # 基波保护（对数幅度差）
+                    win = torch.hann_window(T, device=device, dtype=x.dtype).view(1, 1, -1)
+                    Yh = torch.fft.rfft(y_hat * win, dim=-1, norm="ortho")
+                    Yr = torch.fft.rfft(y * win, dim=-1, norm="ortho")
+                    fund_mag_hat = torch.abs(Yh[..., int(k)]) + 1e-12
+                    fund_mag_ref = torch.abs(Yr[..., int(k)]) + 1e-12
+                    loss_fund = torch.mean((torch.log10(fund_mag_hat) - torch.log10(fund_mag_ref)) ** 2)
+
+                    loss_delta = torch.mean((y_hat - x) ** 2)
+                    loss_time = torch.mean((y_hat - y) ** 2)
+
+                    # 正则：系数 L2（更保守）
+                    reg = 0.0
+                    # 新 MP 实现：参数名为 raw_even/raw_odd（已做限幅），这里直接对所有参数做 L2 即可
+                    for p in ddsp_model.parameters():
+                        reg = reg + torch.mean(p ** 2)
+
+                    loss = (
+                        float(STAGE3_W_TIME) * loss_time
+                        + float(STAGE3_W_HARM) * loss_harm
+                        + float(STAGE3_W_FUND) * loss_fund
+                        + float(STAGE3_W_DELTA) * loss_delta
+                        + float(STAGE3_W_REG) * reg
+                    )
+                    loss_acc = loss_acc + loss
+
+                loss_acc = loss_acc / float(max(int(STAGE3_BATCH), 1))
+                opt3.zero_grad()
+                loss_acc.backward()
+                torch.nn.utils.clip_grad_norm_(ddsp_model.parameters(), max_norm=1.0)
+                opt3.step()
+
+                if step % 150 == 0:
+                    with torch.no_grad():
+                        w_mean = float(torch.mean(torch.stack([p.abs().mean() for p in ddsp_model.parameters()])).detach().cpu())
+                    print(f"Stage3(Post-NL, PINN-MP) step {step:4d}/{int(steps)} | loss={loss_acc.item():.3e} | w_mean~{w_mean:.2e}")
+
+            return ddsp_model, params_ref
 
         def _solve_ridge(A: np.ndarray, b: np.ndarray, ridge: float) -> np.ndarray:
             P = A.shape[0]
@@ -4933,8 +6633,9 @@ def train_relative_calibration(simulator, device='cpu'):
         return ddsp_model, params_ref
 
     ddsp_model = None
-    # 若启用 Post-EQ，则默认不再训练 Stage3（避免两套后级互相“打架”）
-    if (not ENABLE_POST_EQ) and ENABLE_STAGE3_NONLINEAR:
+    # 运行链路收敛：Stage1/2 + Post-QE(物理静态逆) + Stage3(Post-NL 记忆多项式)
+    # 旧逻辑：启用 Post-EQ 时关闭 Stage3。现在 Post-EQ 已被替换为 Post-QE，且 Stage3 是“新方案”必选项，因此不再互斥。
+    if ENABLE_STAGE3_NONLINEAR:
         if STAGE3_AUTOSEARCH:
             print("\n=== Stage 3: AutoSearch (fixed Stage1/2, search best Stage3 config) ===")
             best_cfg = _autosearch_stage3()
@@ -5455,20 +7156,27 @@ def calculate_metrics_detailed(sim, model, scale, device, p_ch0, p_ch1):
         sig_pre = interleave(c0, c1_raw)
         sig_post_lin = interleave(c0, c1_cal)
 
-        # 先算 Post-EQ（交织后线性均衡）：只影响 *_post_eq，不与 Stage3 “后级非线性”混淆
-        if hasattr(model, "post_fir_even") and hasattr(model, "post_fir_odd") and (model.post_fir_even is not None) and (model.post_fir_odd is not None):
+        # 先算 Post-QE（替代原 Post-EQ）：物理信息静态逆模型层
+        # 兼容：如果仍挂载了旧的 post_fir/post_fir_even/odd，也保留旧分支
+        if hasattr(model, "post_qe") and (model.post_qe is not None):
+            s_qe = max(np.max(np.abs(sig_post_lin)), 1e-12)
+            with torch.no_grad():
+                xq = torch.FloatTensor(sig_post_lin / s_qe).view(1, 1, -1).to(device)
+                yq = model.post_qe(xq).cpu().numpy().flatten() * s_qe
+            sig_post_eq = yq
+        elif hasattr(model, "post_fir_even") and hasattr(model, "post_fir_odd") and (model.post_fir_even is not None) and (model.post_fir_odd is not None):
             sig_post_eq = apply_post_eq_fir_ptv2(sig_post_lin, post_fir_even=model.post_fir_even, post_fir_odd=model.post_fir_odd, device=device)
         elif hasattr(model, "post_fir") and model.post_fir is not None:
             sig_post_eq = apply_post_eq_fir(sig_post_lin, post_fir=model.post_fir, device=device)
         else:
             sig_post_eq = sig_post_lin
 
-        # 再算 Post-NL（交织后非线性修整）：保持与训练口径一致（默认作用于 sig_post_lin）
+        # 再算 Post-NL（交织后非线性修整）：与新链路保持一致，作用于 Post-QE 的输出
         if hasattr(model, 'post_linearizer') and model.post_linearizer is not None:
             scale_pl = getattr(model, 'post_linearizer_scale', None)
             if scale_pl is None:
-                scale_pl = max(np.max(np.abs(sig_post_lin)), 1e-12)
-            sig_post_t = torch.FloatTensor(sig_post_lin / scale_pl).view(1, 1, -1).to(device)
+                scale_pl = max(np.max(np.abs(sig_post_eq)), 1e-12)
+            sig_post_t = torch.FloatTensor(sig_post_eq / scale_pl).view(1, 1, -1).to(device)
             with torch.no_grad():
                 sig_final_t = model.post_linearizer(sig_post_t)
             sig_post_nl = sig_final_t.cpu().numpy().flatten() * scale_pl
@@ -5738,7 +7446,7 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("\n=== 运行配置摘要 ===")
     print(f"ENABLE_STAGE3_NONLINEAR={ENABLE_STAGE3_NONLINEAR} | STAGE3_SCHEME={STAGE3_SCHEME} | STAGE3_USE_REFERENCE_TARGET={STAGE3_USE_REFERENCE_TARGET}")
-    print(f"ENABLE_POST_EQ={ENABLE_POST_EQ} | POST_EQ_MODE={POST_EQ_MODE} | POST_EQ_USE_REFERENCE_TARGET={POST_EQ_USE_REFERENCE_TARGET} | POST_EQ_BAND_HZ={POST_EQ_BAND_HZ/1e9:.2f}GHz | POST_EQ_TAPS={POST_EQ_TAPS} | POST_EQ_RIDGE={POST_EQ_RIDGE:g}")
+    print(f"ENABLE_POST_EQ={ENABLE_POST_EQ} | (Post-QE physics layer) | POST_EQ_MODE={POST_EQ_MODE} | POST_EQ_USE_REFERENCE_TARGET={POST_EQ_USE_REFERENCE_TARGET} | POST_EQ_BAND_HZ={POST_EQ_BAND_HZ/1e9:.2f}GHz | POST_EQ_TAPS={POST_EQ_TAPS} | POST_EQ_RIDGE={POST_EQ_RIDGE:g}")
     if not ENABLE_STAGE3_NONLINEAR:
         print(">> Stage3 已关闭：Post-NL 将与 Post-Linear 完全相同（这是预期行为）")
     sim = TIADCSimulator(fs=20e9)
@@ -5771,7 +7479,8 @@ if __name__ == "__main__":
             )
         eq_str = ""
         if (
-            (hasattr(model, "post_fir") and model.post_fir is not None)
+            (hasattr(model, "post_qe") and model.post_qe is not None)
+            or (hasattr(model, "post_fir") and model.post_fir is not None)
             or (
                 hasattr(model, "post_fir_even")
                 and hasattr(model, "post_fir_odd")
@@ -5780,7 +7489,7 @@ if __name__ == "__main__":
             )
         ):
             eq_str = (
-                f" | Post-EQ: SINAD {m['sinad_post_eq'][i]:>6.2f} dB"
+                f" | Post-QE: SINAD {m['sinad_post_eq'][i]:>6.2f} dB"
                 f", THD {m['thd_post_eq'][i]:>7.2f} dBc"
                 f", SFDR {m['sfdr_post_eq'][i]:>6.2f} dBc"
             )
@@ -5808,7 +7517,8 @@ if __name__ == "__main__":
     plt.plot(test_freqs/1e9, m['sinad_pre'], 'r--o', alpha=0.5, label='Pre-Calib')
     plt.plot(test_freqs/1e9, m['sinad_post'], 'g-o', linewidth=2, label='Post-Linear')
     if (
-        (hasattr(model, "post_fir") and model.post_fir is not None)
+        (hasattr(model, "post_qe") and model.post_qe is not None)
+        or (hasattr(model, "post_fir") and model.post_fir is not None)
         or (
             hasattr(model, "post_fir_even")
             and hasattr(model, "post_fir_odd")
@@ -5816,7 +7526,7 @@ if __name__ == "__main__":
             and (model.post_fir_odd is not None)
         )
     ):
-        plt.plot(test_freqs/1e9, m['sinad_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-EQ')
+        plt.plot(test_freqs/1e9, m['sinad_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-QE')
     if 'sinad_post_nl' in m:
         plt.plot(test_freqs/1e9, m['sinad_post_nl'], 'b--o', alpha=0.85, label='Post-NL')
     plt.title("SINAD Improvement")
@@ -5827,7 +7537,8 @@ if __name__ == "__main__":
     plt.plot(test_freqs/1e9, m['enob_pre'], 'r--o', alpha=0.5, label='Pre-Calib')
     plt.plot(test_freqs/1e9, m['enob_post'], 'm-o', linewidth=2, label='Post-Linear')
     if (
-        (hasattr(model, "post_fir") and model.post_fir is not None)
+        (hasattr(model, "post_qe") and model.post_qe is not None)
+        or (hasattr(model, "post_fir") and model.post_fir is not None)
         or (
             hasattr(model, "post_fir_even")
             and hasattr(model, "post_fir_odd")
@@ -5835,7 +7546,7 @@ if __name__ == "__main__":
             and (model.post_fir_odd is not None)
         )
     ):
-        plt.plot(test_freqs/1e9, m['enob_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-EQ')
+        plt.plot(test_freqs/1e9, m['enob_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-QE')
     if 'enob_post_nl' in m:
         plt.plot(test_freqs/1e9, m['enob_post_nl'], 'b--o', alpha=0.85, label='Post-NL')
     plt.title("ENOB Improvement")
@@ -5846,7 +7557,8 @@ if __name__ == "__main__":
     plt.plot(test_freqs/1e9, m['thd_pre'], 'r--o', alpha=0.5, label='Pre-Calib (Ch1 Raw)')
     plt.plot(test_freqs/1e9, m['thd_post'], 'b-o', linewidth=2, label='Post-Linear')
     if (
-        (hasattr(model, "post_fir") and model.post_fir is not None)
+        (hasattr(model, "post_qe") and model.post_qe is not None)
+        or (hasattr(model, "post_fir") and model.post_fir is not None)
         or (
             hasattr(model, "post_fir_even")
             and hasattr(model, "post_fir_odd")
@@ -5854,7 +7566,7 @@ if __name__ == "__main__":
             and (model.post_fir_odd is not None)
         )
     ):
-        plt.plot(test_freqs/1e9, m['thd_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-EQ')
+        plt.plot(test_freqs/1e9, m['thd_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-QE')
     if 'thd_post_nl' in m:
         plt.plot(test_freqs/1e9, m['thd_post_nl'], 'k--o', alpha=0.85, label='Post-NL')
     # 可选：画出 Ch0 的 THD 作为基准线 (Target)
@@ -5867,7 +7579,8 @@ if __name__ == "__main__":
     plt.plot(test_freqs/1e9, m['sfdr_pre'], 'r--o', alpha=0.5, label='Pre-Calib (Ch1 Raw)')
     plt.plot(test_freqs/1e9, m['sfdr_post'], 'c-o', linewidth=2, label='Post-Linear')
     if (
-        (hasattr(model, "post_fir") and model.post_fir is not None)
+        (hasattr(model, "post_qe") and model.post_qe is not None)
+        or (hasattr(model, "post_fir") and model.post_fir is not None)
         or (
             hasattr(model, "post_fir_even")
             and hasattr(model, "post_fir_odd")
@@ -5875,7 +7588,7 @@ if __name__ == "__main__":
             and (model.post_fir_odd is not None)
         )
     ):
-        plt.plot(test_freqs/1e9, m['sfdr_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-EQ')
+        plt.plot(test_freqs/1e9, m['sfdr_post_eq'], color='#ff7f0e', marker='o', linewidth=2, label='Post-QE')
     if 'sfdr_post_nl' in m:
         plt.plot(test_freqs/1e9, m['sfdr_post_nl'], 'b--o', alpha=0.85, label='Post-NL')
     plt.title("SFDR Improvement")
