@@ -117,6 +117,163 @@ def _stage12_prepare_input(y1: np.ndarray) -> np.ndarray:
     return c1
 
 
+def _next_pow2(n: int) -> int:
+    n = int(n)
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _hermitianize_rfft_bins(W_rfft: np.ndarray, n_fft: int) -> np.ndarray:
+    """
+    将 rfft（0..N/2）频响补齐成完整 N 点 FFT 频响，满足 Hermitian 对称，
+    以便 ifft 得到（近似）实系数时域响应。
+    W_rfft: [..., N/2+1] complex
+    return: [..., N] complex
+    """
+    n_fft = int(n_fft)
+    if n_fft < 2:
+        raise ValueError("n_fft must be >=2")
+    if W_rfft.shape[-1] != (n_fft // 2 + 1):
+        raise ValueError("W_rfft last dim must be n_fft//2+1")
+    # [0 .. N/2] + conj([N/2-1 .. 1])
+    tail = np.conj(W_rfft[..., -2:0:-1])
+    return np.concatenate([W_rfft, tail], axis=-1)
+
+
+def solve_stage12_mimo_wiener_fir(
+    sim: "TIADCSimulator",
+    *,
+    p0: dict,
+    p1: dict,
+    pref: dict,
+    n_full: int,
+    n_records: int,
+    fir_taps: int,
+    guard_drop: int = 256,
+    reg_mu: float = 1e-6,
+    wls_alpha: float = 0.0,
+    wls_power: float = 2.0,
+) -> np.ndarray:
+    """
+    2×2 MIMO（半速域）维纳/加权最小二乘闭式解：
+    - 令 x0[n]=ideal even samples, x1[n]=ideal odd samples（由 pref 产生）
+    - 令 g0[n], g1[n] 为实际两路采样子序列（由 p0/p1 产生）
+    - 频域上求 W(ω)=S_xg(ω)·(S_gg(ω)+μI)^{-1}，得到最小均方误差线性估计器 x̂=Wg
+    - 再将 W(ω) IFFT 截断为长度 fir_taps 的 2×2 FIR（写入 mix_fir）
+
+    这是“通用且有理论支撑”的 TIADC 多相校准范式，避免单音在 fs/4 附近不可辨识导致的掉点。
+
+    返回：w_time shape=(2,2,fir_taps) float32，其中 out=[x0,x1], in=[g0,g1]
+    """
+    n_full = int(n_full)
+    n_records = int(n_records)
+    fir_taps = int(fir_taps)
+    if fir_taps < 5:
+        fir_taps = 5
+    if fir_taps % 2 == 0:
+        fir_taps += 1
+    n2 = n_full // 2
+    if n2 < 512:
+        raise ValueError("n_full too small for MIMO solver")
+    # 使用 rfft 以简化 Hermitian 处理
+    n_fft = _next_pow2(n2)
+    n_rfft = n_fft // 2 + 1
+
+    # 频率加权：w(ω)=1+alpha*(ω/π)^p ，属于 WLS 的标准做法
+    k = np.arange(n_rfft, dtype=np.float64)
+    w = 1.0 + float(wls_alpha) * ((k / max(1.0, (n_rfft - 1))) ** float(max(0.0, wls_power)))
+    w = w.astype(np.float64)
+
+    # 累计谱矩阵：S_xg(ω) 和 S_gg(ω)
+    S_xg = np.zeros((2, 2, n_rfft), dtype=np.complex128)
+    S_gg = np.zeros((2, 2, n_rfft), dtype=np.complex128)
+
+    # 为了减少边缘效应，丢弃头尾 guard_drop（相当于有效采样窗口）
+    gd = int(max(0, guard_drop))
+    for _ in range(n_records):
+        # 用相干多音作为持久激励（满秩更好，且与评估口径一致）
+        # tone 数和分离度取“够用且稳”的默认值
+        k_bins = _sample_k_set(8, n_full // 2 - 8, n_tones=8, min_sep=48, n=n_full, avoid_image_collision=True)
+        src = _multisine_np(n=n_full, bins=k_bins, amp=float(np.random.uniform(0.55, 0.92)))
+        # 实际采样（含失配）
+        c0, c1, _ = sim.capture_two_way(src, p0=p0, p1=p1, n_bits=ADC_NBITS)
+        g0 = c0[0::2].astype(np.float64, copy=False)
+        g1 = c1[1::2].astype(np.float64, copy=False)
+        # 理想参考（同样只在相位点采样，且不加抖动/非线性；量化也建议关掉）
+        c0r, c1r, _ = sim.capture_two_way(src, p0=pref, p1=pref, n_bits=None)
+        x0 = c0r[0::2].astype(np.float64, copy=False)
+        x1 = c1r[1::2].astype(np.float64, copy=False)
+
+        # 对齐长度（安全起见）
+        L = min(len(g0), len(g1), len(x0), len(x1))
+        g0 = g0[:L]
+        g1 = g1[:L]
+        x0 = x0[:L]
+        x1 = x1[:L]
+        if gd * 2 + 16 < L:
+            g0 = g0[gd:-gd]
+            g1 = g1[gd:-gd]
+            x0 = x0[gd:-gd]
+            x1 = x1[gd:-gd]
+            L = len(g0)
+        # 归一化（避免不同 record 幅度差异影响谱矩阵条件数）
+        s = max(float(np.max(np.abs([g0, g1, x0, x1]))), 1e-12)
+        g0 = (g0 / s).astype(np.float64, copy=False)
+        g1 = (g1 / s).astype(np.float64, copy=False)
+        x0 = (x0 / s).astype(np.float64, copy=False)
+        x1 = (x1 / s).astype(np.float64, copy=False)
+
+        # 加窗 rfft
+        win = np.hanning(L).astype(np.float64)
+        # zero-pad 到 n_fft
+        G0 = np.fft.rfft((g0 - np.mean(g0)) * win, n=n_fft)
+        G1 = np.fft.rfft((g1 - np.mean(g1)) * win, n=n_fft)
+        X0 = np.fft.rfft((x0 - np.mean(x0)) * win, n=n_fft)
+        X1 = np.fft.rfft((x1 - np.mean(x1)) * win, n=n_fft)
+
+        # 组装向量
+        G = np.stack([G0, G1], axis=0)  # [2, K]
+        X = np.stack([X0, X1], axis=0)  # [2, K]
+
+        # S_gg += w * (G G^H), S_xg += w * (X G^H)
+        # 对每个频点独立计算 2x2 外积
+        for kk in range(n_rfft):
+            gk = G[:, kk:kk + 1]  # [2,1]
+            xk = X[:, kk:kk + 1]
+            wk = w[kk]
+            S_gg[:, :, kk] += wk * (gk @ np.conj(gk.T))
+            S_xg[:, :, kk] += wk * (xk @ np.conj(gk.T))
+
+    # 频点上求解 W(ω)=S_xg(ω)·(S_gg(ω)+μI)^{-1}
+    mu = float(max(0.0, reg_mu))
+    W_rfft = np.zeros((2, 2, n_rfft), dtype=np.complex128)
+    I2 = np.eye(2, dtype=np.complex128)
+    for kk in range(n_rfft):
+        A = S_gg[:, :, kk] + mu * I2
+        # 数值稳健：如果 A 奇异，给一点额外对角加载
+        try:
+            Ai = np.linalg.inv(A)
+        except np.linalg.LinAlgError:
+            Ai = np.linalg.inv(A + (mu + 1e-4) * I2)
+        W_rfft[:, :, kk] = S_xg[:, :, kk] @ Ai
+
+    # IFFT -> 截断 FIR taps
+    # 先补齐全谱，再 ifft，得到循环时域响应，然后 fftshift 取中心 taps
+    W_full = _hermitianize_rfft_bins(W_rfft, n_fft)  # [2,2,N]
+    w_time_full = np.fft.ifft(W_full, axis=-1)  # complex, [2,2,N]
+    w_time_full = np.real(w_time_full)
+    w_time_full = np.fft.fftshift(w_time_full, axes=-1)  # 让“零时刻”居中
+
+    mid = n_fft // 2
+    half = fir_taps // 2
+    w_cut = w_time_full[:, :, mid - half: mid + half + 1]
+    # 轻微加窗减少截断纹波
+    win_t = np.hamming(fir_taps).astype(np.float64)
+    w_cut = (w_cut * win_t.reshape(1, 1, -1)).astype(np.float32, copy=False)
+    return w_cut
+
+
 class TIADCSimulator:
     def __init__(self, fs: float = 20e9):
         self.fs = float(fs)
@@ -456,7 +613,10 @@ class PolyphaseStage12Model(nn.Module):
         # 允许少量 cross-coupling（g0/g1 互相补偿）更接近实际的多相校正器结构。
         self.use_xcouple = _env_bool("STAGE12_USE_XCOUPLE", True)
         if self.use_xcouple:
-            mtaps = _env_int("STAGE12_XCOUPLE_TAPS", 49)
+            # MIMO 系统辨识模式下，2×2 FIR 需要更长 taps 才能稳定拟合（尤其是接近 fs/4 的幅相失配）。
+            # 默认关闭 MIMO（恢复修改前方案），需用时设 STAGE12_MIMO_LS=1。
+            _mimo = _env_bool("STAGE12_MIMO_LS", False)
+            mtaps = _env_int("STAGE12_XCOUPLE_TAPS", 257 if _mimo else 49)
             mtaps = int(mtaps)
             if mtaps % 2 == 0:
                 mtaps += 1
@@ -776,6 +936,31 @@ def _fir_gain_band_loss(w: torch.Tensor, *, n_fft: int = 1024, min_gain: float =
     return torch.mean(lo * lo + hi * hi)
 
 
+def _mimo_fir_gain_band_loss(
+    w2: torch.Tensor,
+    *,
+    n_fft: int = 1024,
+    diag_min_gain: float = 0.8,
+    diag_max_gain: float = 1.25,
+    x_max_gain: float = 0.35,
+) -> torch.Tensor:
+    """
+    2×2 FIR 频响约束（MIMO 系统辨识里非常关键）：
+    - 对角支路（self terms）幅度应接近 1：限制在 [diag_min_gain, diag_max_gain]
+    - 交叉支路（cross terms）应更小：限制在 [0, x_max_gain]
+
+    目的：防止“求逆/欠定解”把噪声或镜像 spur 一起放大，出现校准后更差。
+    """
+    if w2.ndim != 3 or int(w2.shape[0]) != 2 or int(w2.shape[1]) != 2:
+        return torch.zeros((), device=w2.device, dtype=w2.dtype)
+    loss = 0.0
+    for i in range(2):
+        loss = loss + _fir_gain_band_loss(w2[i, i, :].contiguous(), n_fft=int(n_fft), min_gain=float(diag_min_gain), max_gain=float(diag_max_gain))
+    loss = loss + _fir_gain_band_loss(w2[0, 1, :].contiguous(), n_fft=int(n_fft), min_gain=0.0, max_gain=float(x_max_gain))
+    loss = loss + _fir_gain_band_loss(w2[1, 0, :].contiguous(), n_fft=int(n_fft), min_gain=0.0, max_gain=float(x_max_gain))
+    return loss / 4.0
+
+
 def _spec_hold_excluding_bins_loss(
     yhat: torch.Tensor,
     yin: torch.Tensor,
@@ -981,6 +1166,16 @@ def train_stage12(sim: TIADCSimulator, *, device: str, p0: dict, p1: dict, pref:
     # 现实工程默认更稳：固定偶相(ADC0)为参考，只训练奇相(ADC1)的主路等化；
     # 镜像 spur 的主要抑制依赖 widely-linear 分支（img_cancel / xcouple），它们天然使用两路信息。
     train_both = _env_bool("STAGE12_TRAIN_BOTH", False)
+    # 2×2 MIMO（系统辨识）模式：用 pref 提供的参考采样做监督，让问题变成可辨识的 MIMO 最小二乘系统辨识。
+    # 这是更通用、理论闭环的解法（持久激励 + 监督辨识 + 正则化/增益约束），避免 fs/4 附近病态导致掉点。
+    # 默认使用修改前的方案：polyphase + 自监督镜像抑制（效果更稳、低频/高频整体更好）。
+    # 若需尝试 2×2 MIMO 监督系统辨识，可显式设置 STAGE12_MIMO_LS=1。
+    mimo_mode = _env_bool("STAGE12_MIMO_LS", False)
+    if mimo_mode:
+        if pref is None:
+            raise RuntimeError("STAGE12_MIMO_LS=1 requires pref (reference ADC) in simulation")
+        use_ref = True
+        train_both = True
     # 工程建议：高频想要有效，FIR taps 往往需要 >=129（默认提高）
     taps = _env_int("STAGE12_TAPS", 257)
     n = _env_int("STAGE12_TONE_N", 16384)
@@ -999,9 +1194,10 @@ def train_stage12(sim: TIADCSimulator, *, device: str, p0: dict, p1: dict, pref:
     guard = _env_int("STAGE12_IMG_GUARD", 3)
     # 权重：监督参考时以 ref 对齐为主，镜像 spur 仅作为正则
     # 高端镜像往往是 SINAD/SFDR 的主瓶颈，因此在自监督模式下默认给更高权重
-    w_img = _env_float("STAGE12_W_IMG", 600.0 if use_ref else 5500.0)
+    # 监督系统辨识时：镜像 spur 主要由 ref 对齐自然压制，这里只给小权重当正则
+    w_img = _env_float("STAGE12_W_IMG", 40.0 if mimo_mode else (600.0 if use_ref else 5500.0))
     w_ref_time = _env_float("STAGE12_W_REF_TIME", 35.0)
-    w_ref_spec = _env_float("STAGE12_W_REF_SPEC", 6.0)
+    w_ref_spec = _env_float("STAGE12_W_REF_SPEC", 10.0 if mimo_mode else 6.0)
     # 约束项：不要让 yhat 偏离输入太多；基波保持用于防投机
     w_delta = _env_float("STAGE12_W_DELTA", 2.0)
     w_fund = _env_float("STAGE12_W_FUND", 3.0)
@@ -1024,6 +1220,74 @@ def train_stage12(sim: TIADCSimulator, *, device: str, p0: dict, p1: dict, pref:
         model = PolyphaseStage12Model(taps=taps, train_both=train_both).to(device)
     else:
         model = Stage12Model(taps=taps).to(device)
+
+    # 2×2 MIMO（半速域）闭式解：理论上更“通用”
+    # - 需要 pref（参考 ADC）提供 x0/x1 的理想采样
+    # - 求得的 2×2 FIR 直接写入 model.mix_fir（xcouple 分支），并将 even/odd 主路固定为 identity
+    # 现实落地：在实测里 pref 等价于“已知激励/参考通道”，若拿不到就不能做监督闭式解，只能走自监督镜像 spur 目标。
+    # 注意：闭式解对窗函数/截断/Conv1d 互相关口径非常敏感，这里保留为实验开关，默认关闭。
+    use_mimo_ls = _env_bool("STAGE12_MIMO_CLOSED_FORM", False) and use_polyphase and (pref is not None)
+    if use_mimo_ls:
+        if not isinstance(model, PolyphaseStage12Model):
+            raise RuntimeError("STAGE12_MIMO_LS requires STAGE12_POLYPHASE=1")
+        # 强制启用 2×2 FIR
+        if not getattr(model, "use_xcouple", False):
+            raise RuntimeError("STAGE12_MIMO_LS requires STAGE12_USE_XCOUPLE=1 (mix_fir enabled)")
+        mtaps = int(getattr(model, "mix_fir").weight.shape[-1])
+        # 求解参数
+        n_rec = _env_int("STAGE12_MIMO_REC", 24)
+        mu = _env_float("STAGE12_MIMO_MU", 3e-6)
+        wls_a = _env_float("STAGE12_MIMO_WLS_ALPHA", 1.0)
+        wls_p = _env_float("STAGE12_MIMO_WLS_POWER", 2.0)
+        gd = _env_int("STAGE12_MIMO_GUARD_DROP", 256)
+        print(
+            f"=== Stage1/2 (2x2 MIMO-Wiener LS) mtaps={mtaps} N={n} rec={n_rec} mu={mu:g} "
+            f"WLS(alpha={wls_a:g},p={wls_p:g}) ==="
+        )
+        w_mimo = solve_stage12_mimo_wiener_fir(
+            sim,
+            p0=p0,
+            p1=p1,
+            pref=pref,
+            n_full=int(n),
+            n_records=int(n_rec),
+            fir_taps=int(mtaps),
+            guard_drop=int(gd),
+            reg_mu=float(mu),
+            wls_alpha=float(wls_a),
+            wls_power=float(wls_p),
+        )
+        with torch.no_grad():
+            # 固定两路主路为 identity（把所有线性校正都交给 2×2 MIMO FIR）
+            model.train_both = False
+            # even：identity
+            model.even.gain.fill_(1.0)
+            model.even.delay.delay.fill_(0.0)
+            model.even.fir.weight.zero_()
+            model.even.fir.weight[0, 0, int(model.even.fir.weight.shape[-1] // 2)] = 1.0
+            for p in model.even.parameters():
+                p.requires_grad_(False)
+            # odd：identity
+            model.odd.gain.fill_(1.0)
+            model.odd.delay.delay.fill_(0.0)
+            model.odd.fir.weight.zero_()
+            model.odd.fir.weight[0, 0, int(model.odd.fir.weight.shape[-1] // 2)] = 1.0
+            for p in model.odd.parameters():
+                p.requires_grad_(False)
+            # 写入 2×2 FIR：out=[x0,x1], in=[g0,g1]
+            # 注意：PyTorch Conv1d 做的是“互相关”(cross-correlation)，不是数学意义的卷积。
+            # 我们用频域/卷积口径求得的 FIR 需要在写入权重前做 time-reverse，否则会等价于用反向滤波器，性能会严重恶化。
+            w_mimo_cc = w_mimo[..., ::-1].copy()
+            model.mix_fir.weight.copy_(torch.tensor(w_mimo_cc, dtype=model.mix_fir.weight.dtype, device=model.mix_fir.weight.device))
+            for p in model.mix_fir.parameters():
+                p.requires_grad_(False)
+            # 关闭 image-canceller（可选）；MIMO 已能处理大部分镜像抑制，避免重复自由度造成不可控增益
+            if getattr(model, "use_img_cancel", False) and _env_bool("STAGE12_MIMO_DISABLE_IMG_CANCEL", True):
+                model.img_fir.weight.zero_()
+                for p in model.img_fir.parameters():
+                    p.requires_grad_(False)
+        # 返回：闭式解不需要后续 S0/S1/S2 迭代
+        return model, float(scale)
 
     if not use_image_mode:
         # 兼容：保留旧的 supervised 训练（但改成“稀疏输入”，避免偷用偶样本）
@@ -1128,7 +1392,8 @@ def train_stage12(sim: TIADCSimulator, *, device: str, p0: dict, p1: dict, pref:
             # 更贴近现实：直接模拟两片 ADC 的采样（只在各自相位产生样本）
             c0, c1, pre = sim.capture_two_way(src_np, p0=p0, p1=p1, n_bits=ADC_NBITS)
             if use_ref and pref is not None:
-                _, _, ref = sim.capture_two_way(src_np, p0=pref, p1=pref, n_bits=ADC_NBITS)
+                # 参考应尽量“理想”：不量化（否则会把量化误差当作拟合目标，导致噪声放大）
+                c0r, c1r, ref = sim.capture_two_way(src_np, p0=pref, p1=pref, n_bits=None)
             else:
                 ref = None
             s = max(float(np.max(np.abs(pre))), 1e-12)
@@ -1141,7 +1406,15 @@ def train_stage12(sim: TIADCSimulator, *, device: str, p0: dict, p1: dict, pref:
             g0 = torch.tensor((c0[0::2] / s), dtype=torch.float32, device=device).view(1, 1, -1)
             g1 = torch.tensor((c1[1::2] / s), dtype=torch.float32, device=device).view(1, 1, -1)
 
-            if isinstance(model, PolyphaseStage12Model):
+            if mimo_mode and isinstance(model, PolyphaseStage12Model) and (ref is not None) and (pref is not None):
+                # 2×2 MIMO：半速域直接对齐参考子序列（系统辨识口径）
+                g0r = torch.tensor((c0r[0::2] / s), dtype=torch.float32, device=device).view(1, 1, -1)
+                g1r = torch.tensor((c1r[1::2] / s), dtype=torch.float32, device=device).view(1, 1, -1)
+                x2 = torch.cat([g0, g1], dim=1)
+                y2 = model.mix_fir(x2)
+                g0h, g1h = y2[:, 0:1, :], y2[:, 1:2, :]
+                yhat = _interleave_halfrate_torch(g0h, g1h)
+            elif isinstance(model, PolyphaseStage12Model):
                 yhat = model(g0, g1)
             else:
                 # fallback：旧 full-rate 模型（不推荐）
@@ -1205,15 +1478,50 @@ def train_stage12(sim: TIADCSimulator, *, device: str, p0: dict, p1: dict, pref:
 
             # 监督参考：ref 对齐为主；自监督：基波保持+小改动为主
             if use_ref and ref_t is not None:
-                crop = 300
-                l_ref_time = torch.mean((yhat[..., crop:-crop] - ref_t[..., crop:-crop]) ** 2)
-                Yh = torch.fft.rfft(yhat, dim=-1, norm="ortho")
-                Yr = torch.fft.rfft(ref_t, dim=-1, norm="ortho")
-                Ph = (Yh.real**2 + Yh.imag**2) + 1e-12
-                Pr = (Yr.real**2 + Yr.imag**2) + 1e-12
-                l_ref_spec = torch.mean((torch.log10(Ph) - torch.log10(Pr)) ** 2)
-                l_delta = torch.mean((yhat - pre_t) ** 2)
-                loss_main = float(w_ref_time) * l_ref_time + float(w_ref_spec) * l_ref_spec + float(w_img) * l_img + 0.2 * float(w_delta) * l_delta
+                crop = 256
+                if mimo_mode and isinstance(model, PolyphaseStage12Model) and (ref is not None) and (pref is not None):
+                    # MIMO：在半速域做 WLS 的 system-ID（更贴近理论）
+                    l_ref_time = 0.5 * (
+                        torch.mean((g0h[..., crop:-crop] - g0r[..., crop:-crop]) ** 2)
+                        + torch.mean((g1h[..., crop:-crop] - g1r[..., crop:-crop]) ** 2)
+                    )
+                    use_wls = _env_bool("STAGE12_REF_SPEC_WLS", True)
+                    n2 = int(g0h.shape[-1])
+                    win2 = torch.hann_window(n2, device=device, dtype=g0h.dtype).view(1, 1, -1)
+                    G0h = torch.fft.rfft((g0h - torch.mean(g0h, dim=-1, keepdim=True)) * win2, dim=-1, norm="ortho")
+                    G1h = torch.fft.rfft((g1h - torch.mean(g1h, dim=-1, keepdim=True)) * win2, dim=-1, norm="ortho")
+                    G0r = torch.fft.rfft((g0r - torch.mean(g0r, dim=-1, keepdim=True)) * win2, dim=-1, norm="ortho")
+                    G1r = torch.fft.rfft((g1r - torch.mean(g1r, dim=-1, keepdim=True)) * win2, dim=-1, norm="ortho")
+                    if use_wls:
+                        alpha_w = _env_float("STAGE12_REF_SPEC_WLS_ALPHA", 1.0)
+                        pow_w = _env_float("STAGE12_REF_SPEC_WLS_POWER", 2.0)
+                        K = int(G0h.shape[-1] - 1)
+                        kk = torch.arange(int(G0h.shape[-1]), device=device, dtype=g0h.dtype).view(1, 1, -1)
+                        wls = 1.0 + float(alpha_w) * torch.pow(kk / float(max(1, K)), float(max(0.0, pow_w)))
+                    else:
+                        wls = 1.0
+                    l_ref_spec = 0.5 * (torch.mean(torch.abs((G0h - G0r) * wls) ** 2) + torch.mean(torch.abs((G1h - G1r) * wls) ** 2))
+                    l_delta = torch.mean((yhat - pre_t) ** 2)
+                    loss_main = float(w_ref_time) * l_ref_time + float(w_ref_spec) * l_ref_spec + float(w_img) * l_img + 0.35 * float(w_delta) * l_delta
+                else:
+                    l_ref_time = torch.mean((yhat[..., crop:-crop] - ref_t[..., crop:-crop]) ** 2)
+                    Yh = torch.fft.rfft(yhat, dim=-1, norm="ortho")
+                    Yr = torch.fft.rfft(ref_t, dim=-1, norm="ortho")
+                    Ph = (Yh.real**2 + Yh.imag**2) + 1e-12
+                    Pr = (Yr.real**2 + Yr.imag**2) + 1e-12
+                    dh = torch.log10(Ph) - torch.log10(Pr)
+                    use_wls = _env_bool("STAGE12_REF_SPEC_WLS", False)
+                    if use_wls:
+                        alpha_w = _env_float("STAGE12_REF_SPEC_WLS_ALPHA", 0.3)
+                        pow_w = _env_float("STAGE12_REF_SPEC_WLS_POWER", 2.0)
+                        K = int(dh.shape[-1] - 1)
+                        kk = torch.arange(int(dh.shape[-1]), device=dh.device, dtype=dh.dtype)
+                        wls = 1.0 + float(alpha_w) * torch.pow(kk / float(max(1, K)), float(max(0.0, pow_w)))
+                        l_ref_spec = torch.mean((dh * wls) ** 2)
+                    else:
+                        l_ref_spec = torch.mean(dh**2)
+                    l_delta = torch.mean((yhat - pre_t) ** 2)
+                    loss_main = float(w_ref_time) * l_ref_time + float(w_ref_spec) * l_ref_spec + float(w_img) * l_img + 0.2 * float(w_delta) * l_delta
             else:
                 k_rep = int(k_funds_local[len(k_funds_local) // 2]) if len(k_funds_local) else int(max(k_min, 8))
                 l_fund = _funds_hold_loss(yhat, pre_t, fund_bins=k_funds_local, guard=int(guard)) if len(k_funds_local) else _fund_hold_loss(yhat, pre_t, fund_bin=int(k_rep), guard=int(guard))
@@ -1229,18 +1537,31 @@ def train_stage12(sim: TIADCSimulator, *, device: str, p0: dict, p1: dict, pref:
 
             # FIR 正则：平滑 + 频响增益约束（防止噪声放大导致某段频率崩盘）
             if isinstance(model, PolyphaseStage12Model):
-                w1 = model.odd.fir.weight.view(-1)
-                l_reg = torch.mean((w1[1:] - w1[:-1]) ** 2)
-                l_band = _fir_gain_band_loss(w1, n_fft=1024, min_gain=fir_min_gain, max_gain=fir_max_gain)
-                if getattr(model, "train_both", False):
-                    w0 = model.even.fir.weight.view(-1)
-                    l_reg = l_reg + torch.mean((w0[1:] - w0[:-1]) ** 2)
-                    l_band = l_band + _fir_gain_band_loss(w0, n_fft=1024, min_gain=fir_min_gain, max_gain=fir_max_gain)
-                # 交叉耦合 FIR：默认应很小（接近单位阵），否则容易抬噪声/改坏带内谱形
-                if getattr(model, "use_xcouple", False):
-                    wx = model.mix_fir.weight
-                    w_x_l2 = _env_float("STAGE12_W_XCOUPLE_L2", 5e-4)
+                if mimo_mode and getattr(model, "use_xcouple", False):
+                    # MIMO 模式：核心就是 2×2 mix_fir，本段对其做平滑 + 频响约束，避免噪声放大/发散
+                    wx = model.mix_fir.weight  # [2,2,T]
+                    l_reg = 0.0
+                    for oo in range(2):
+                        for ii in range(2):
+                            woi = wx[oo, ii, :].view(-1)
+                            l_reg = l_reg + torch.mean((woi[1:] - woi[:-1]) ** 2)
+                    l_reg = l_reg / 4.0
+                    l_band = _mimo_fir_gain_band_loss(wx, n_fft=1024, diag_min_gain=fir_min_gain, diag_max_gain=fir_max_gain, x_max_gain=0.55)
+                    w_x_l2 = _env_float("STAGE12_W_XCOUPLE_L2", 2e-3)
                     l_reg = l_reg + float(w_x_l2) * torch.mean(wx * wx)
+                else:
+                    w1 = model.odd.fir.weight.view(-1)
+                    l_reg = torch.mean((w1[1:] - w1[:-1]) ** 2)
+                    l_band = _fir_gain_band_loss(w1, n_fft=1024, min_gain=fir_min_gain, max_gain=fir_max_gain)
+                    if getattr(model, "train_both", False):
+                        w0 = model.even.fir.weight.view(-1)
+                        l_reg = l_reg + torch.mean((w0[1:] - w0[:-1]) ** 2)
+                        l_band = l_band + _fir_gain_band_loss(w0, n_fft=1024, min_gain=fir_min_gain, max_gain=fir_max_gain)
+                    # 交叉耦合 FIR：默认应很小（接近单位阵），否则容易抬噪声/改坏带内谱形
+                    if getattr(model, "use_xcouple", False):
+                        wx = model.mix_fir.weight
+                        w_x_l2 = _env_float("STAGE12_W_XCOUPLE_L2", 5e-4)
+                        l_reg = l_reg + float(w_x_l2) * torch.mean(wx * wx)
                 # image-canceller FIR：幅度应当“小且平滑”，避免引入额外噪声/幅频畸变
                 if getattr(model, "use_img_cancel", False):
                     wi = model.img_fir.weight.view(-1)
@@ -1345,6 +1666,49 @@ def train_stage12(sim: TIADCSimulator, *, device: str, p0: dict, p1: dict, pref:
         f"=== Stage1/2 (polyphase={use_polyphase} | ref={use_ref} | train_both={train_both}) taps={taps} N={n} "
         f"f=[{fmin/1e9:.2f},{fmax/1e9:.2f}]GHz | sampler={sampler} | HIGH_BIAS={high_bias:g} ==="
     )
+    # MIMO 模式：固定 even/odd 主路为 identity，只训练 2×2 mix_fir（半速域 MIMO 系统辨识）
+    # 并默认禁用 img_cancel，避免重复自由度导致不稳/噪声放大。
+    if mimo_mode and isinstance(model, PolyphaseStage12Model):
+        if not getattr(model, "use_xcouple", False):
+            raise RuntimeError("STAGE12_MIMO_LS=1 requires STAGE12_USE_XCOUPLE=1 (mix_fir enabled)")
+        with torch.no_grad():
+            # even identity
+            model.even.gain.fill_(1.0)
+            model.even.delay.delay.fill_(0.0)
+            model.even.fir.weight.zero_()
+            model.even.fir.weight[0, 0, int(model.even.fir.weight.shape[-1] // 2)] = 1.0
+            # odd identity
+            model.odd.gain.fill_(1.0)
+            model.odd.delay.delay.fill_(0.0)
+            model.odd.fir.weight.zero_()
+            model.odd.fir.weight[0, 0, int(model.odd.fir.weight.shape[-1] // 2)] = 1.0
+        for p in model.even.parameters():
+            p.requires_grad_(False)
+        for p in model.odd.parameters():
+            p.requires_grad_(False)
+        if getattr(model, "use_img_cancel", False) and _env_bool("STAGE12_MIMO_DISABLE_IMG_CANCEL", True):
+            with torch.no_grad():
+                model.img_fir.weight.zero_()
+            for p in model.img_fir.parameters():
+                p.requires_grad_(False)
+        for p in model.mix_fir.parameters():
+            p.requires_grad_(True)
+
+        mimo_steps = _env_int("STAGE12_MIMO_STEPS", 900)
+        mimo_lr = _env_float("STAGE12_MIMO_LR", 8e-4)
+        mimo_clip = _env_float("STAGE12_MIMO_CLIP", 1.0)
+        # 更适合 MIMO 系统辨识：只需要持续激励（multisine）+ 全频段覆盖
+        print(f"=== StageMIMO: train 2x2 mix_fir only | steps={mimo_steps} lr={mimo_lr:g} ===")
+        optm = optim.Adam(list(model.mix_fir.parameters()), lr=float(mimo_lr), betas=(0.5, 0.9))
+        for step in range(int(mimo_steps)):
+            optm.zero_grad()
+            loss = _make_batch_loss(img_scale=1.0, spec_scale=1.0, stratify_mid_k=(int(n) // 4))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.mix_fir.parameters(), max_norm=float(mimo_clip))
+            optm.step()
+            if step % 150 == 0:
+                print(f"StageMIMO step {step:4d}/{mimo_steps} | loss={loss.item():.3e}")
+        return model, float(scale)
     # Phase-0：先只训练“镜像抑制分支”（widely-linear 的 B(ω)）
     img_params: list[nn.Parameter] = []
     if isinstance(model, PolyphaseStage12Model):
